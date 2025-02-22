@@ -16,13 +16,13 @@ import requests
 import subprocess
 from datetime import timedelta
 
-# ------ הגדרות קבועות ------
+# ------ הגדרות סביבה ------
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 COOKIES_FILE = "cookies.txt"
 
-# ------ וידוא קובץ קוקיז ------
+# ------ בדיקת קובץ קוקיז ------
 if not os.path.exists(COOKIES_FILE):
     raise RuntimeError("קובץ cookies.txt חסר! חובה להוסיף אותו לשרת")
 
@@ -34,7 +34,7 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# ------ ניהול מצבים ------
+# ------ ניהול משאבים ------
 user_locks = defaultdict(Lock)
 active_tasks = {}
 progress_data = defaultdict(dict)
@@ -302,12 +302,13 @@ def handle_upload_progress(current, total, user_id):
         progress = (current / total) * 100
         elapsed = time.time() - progress_data[user_id].get('start_time', time.time())
         speed = current / elapsed if elapsed > 0 else 0
+        eta_seconds = int((total - current) / speed) if speed > 0 else 0
         
         progress_data[user_id].update({
             'progress': round(progress, 1),
             'speed': format_speed(speed),
-            'eta': str(timedelta(seconds=int((total - current)/speed)) if speed > 0 else '00:00',
-            'bar': '●' * int(progress//10) + '◌' * (10 - int(progress//10))
+            'eta': str(timedelta(seconds=eta_seconds)),
+            'bar': '●' * int(progress // 10) + '◌' * (10 - int(progress // 10))
         })
     except:
         pass
