@@ -14,7 +14,7 @@ import subprocess
 # ================= CONFIG ================= #
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"])
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 COOKIES_FILE = "cookies.txt"
 PORT = int(os.environ.get("PORT", 8080))
 
