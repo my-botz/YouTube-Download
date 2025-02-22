@@ -13,14 +13,12 @@ from aiohttp import web
 
 load_dotenv()
 
-# הגדרות לוג
 logging.basicConfig(
     level=logging.INFO,
     format='▸ %(asctime)s ▸ %(levelname)s ▸ %(message)s',
     datefmt='%H:%M:%S'
 )
 
-# הגדרות אפליקציה
 app = Client(
     "file_converter_bot",
     api_id=os.getenv("API_ID"),
@@ -28,16 +26,13 @@ app = Client(
     bot_token=os.getenv("BOT_TOKEN")
 )
 
-# משתנים גלובליים
 THUMBNAILS_DIR = "thumbnails"
 Path(THUMBNAILS_DIR).mkdir(exist_ok=True)
 user_data: Dict[int, dict] = {}
 
-# הרחבות נתמכות
 VIDEO_EXTS = {'.mp4', '.avi', '.mkv', '.mov', '.webm'}
 AUDIO_EXTS = {'.mp3', '.wav', '.ogg', '.flac'}
 
-# ========= פונקציות עזר =========
 def humanbytes(size: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     for unit in units:
@@ -77,20 +72,23 @@ def process_filename(new_name: str, original_name: str, media_type: str) -> str:
             return f"{new_name}{original_ext}"
     return new_name
 
-# ========= handlers =========
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     start_text = """
-    🎥 **ברוך הבא לבוט המרת הקבצים!**
-    
-    ▸ העלה קובץ וידאו/מסמך
-    ▸ שנה שם ופורמט לפי בחירה
-    ▸ ניהול תמונות ממוזערות
-    
+    🌟 **ברוך הבא לבוט ההמרות!** 🌟
+
+    כאן תוכל:
+    ▸ להמיר קבצים בין פורמטים
+    ▸ לשנות שמות קבצים
+    ▸ לנהל תמונות ממוזערות
+
     📜 **פקודות זמינות:**
+    /start - תפריט ראשי
     /view_thumb - הצג תמונה ממוזערת
     /del_thumb - מחק תמונה ממוזערת
     /cancel - ביטול פעולה נוכחית
+
+    ⚡ **גודל מקסימלי:** 2GB
     """
     await message.reply_text(
         start_text,
@@ -104,7 +102,7 @@ async def cancel_command(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in user_data:
         await cleanup_user_data(user_id)
-        await message.reply("✅ כל הפעולות בוטלו!")
+        await message.reply("✅ כל הפעולות בוטלו בהצלחה!")
     else:
         await message.reply("ℹ️ אין פעולות פעילות לביטול")
 
@@ -113,10 +111,7 @@ async def handle_file(client: Client, message: Message):
     user_id = message.from_user.id
     
     if user_data.get(user_id, {}).get('busy'):
-        return await message.reply("""
-        ⚠️ **פעולה קיימת בתהליך!**
-        יש להשלים את הפעולה הנוכחית או להשתמש ב/cancel
-        """)
+        return await message.reply("⚠️ יש להשלים את הפעולה הנוכחית לפני התחלת פעולה חדשה")
     
     file = message.video or message.document
     user_data[user_id] = {
@@ -209,13 +204,10 @@ async def ask_upload_type(user_id: int):
         
         await app.send_message(
             user_id,
-            f"""
-            📁 **פרטי קובץ:**
-            ▸ שם: `{user.get('new_filename', user['original_name'])}`
-            ▸ גודל: {humanbytes(os.path.getsize(file_path))}
-            
-            📤 **בחר פורמט יעד:**
-            """,
+            f"📁 **פרטי קובץ:**\n"
+            f"▸ שם: `{user.get('new_filename', user['original_name']}`\n"
+            f"▸ גודל: {humanbytes(os.path.getsize(file_path))}\n\n"
+            "📤 **בחר פורמט העלאה:**",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("וידאו 🎥", callback_data="upload_video"),
@@ -234,21 +226,22 @@ async def update_progress(current: int, total: int, message: Message, operation:
     percent = current * 100 / total
     bar = progress_bar(percent)
     speed = humanbytes(current / (time.time() - user_data[message.from_user.id]['start_time']))
-    eta = human_time(int((total - current) / (current / (time.time() - user_data[message.from_user.id]['start_time'])) if current > 0 else 0)
+    eta_seconds = (total - current) / (current / (time.time() - user_data[message.from_user.id]['start_time'])) if current > 0 else 0
+    eta = human_time(int(eta_seconds)) if current > 0 else '0 שניות'
     
-    text = f"""
-    🚀 **{operation} מתבצעת**
-    
-    {bar}
-    ▸ 📁 שם: `{user_data[message.from_user.id].get('new_filename', 'קובץ')}`
-    ▸ ⚡ מהירות: {speed}/s
-    ▸ 🕒 זמן משוער: {eta}
-    """
+    text = (
+        f"🚀 **{operation} מתבצעת**\n\n"
+        f"{bar}\n"
+        f"▸ 📁 שם: `{user_data[message.from_user.id].get('new_filename', 'קובץ')}`\n"
+        f"▸ ⚡ מהירות: {speed}/s\n"
+        f"▸ 🕒 זמן משוער: {eta}"
+    )
     
     try:
         await message.edit_text(
             text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה ❌", callback_data="cancel")]])
+        )
     except BadRequest:
         pass
 
@@ -315,8 +308,7 @@ async def process_media(file_path: str, user_id: int, media_type: str) -> str:
 
 async def cleanup_user_data(user_id: int):
     if user_id in user_data:
-        for path in [user_data[user_id].get('file_path'), 
-                   user_data[user_id].get('processed_path')]:
+        for path in [user_data[user_id].get('file_path'), user_data[user_id].get('processed_path')]:
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
@@ -324,14 +316,13 @@ async def cleanup_user_data(user_id: int):
                 pass
         del user_data[user_id]
 
-# ========= שרת בריאות =========
 async def health_check(request):
     return web.Response(text="OK")
 
 async def run_server():
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    runner = web.AppRunner(app)
+    app_web = web.Application()
+    app_web.router.add_get('/health', health_check)
+    runner = web.AppRunner(app_web)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8000)
     await site.start()
