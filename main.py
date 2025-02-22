@@ -175,7 +175,7 @@ async def rename_choice(client: Client, query: CallbackQuery):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎥 וידאו", callback_data="upload_video"),
         [InlineKeyboardButton("📁 קובץ", callback_data="upload_file")]
-    ])
+    ]])
     await query.message.reply_text(
         "📤 בחר פורמט העלאה:",
         reply_markup=keyboard
