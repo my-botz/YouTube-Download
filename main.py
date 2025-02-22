@@ -99,8 +99,8 @@ def progress_hook(d, user_id):
                 'phase': 'download',
                 'progress': float(d['_percent_str'].strip('%')),
                 'speed': format_speed(d['_speed_str'].split(' ')[0]),
-                'eta': str(timedelta(seconds=int(d['_eta_str']))),
-                'bar': '●' * int(d['_percent_str'].strip('%')//10) + '◌' * (10 - int(d['_percent_str'].strip('%')//10))
+                'eta': str(timedelta(seconds=int(d['_eta_str'])) if d['_eta_str'].isdigit() else '00:00',
+                'bar': '●' * int(float(d['_percent_str'].strip('%'))//10 + '◌' * (10 - int(float(d['_percent_str'].strip('%'))//10)
             })
     except Exception as e:
         print(f"Progress error: {e}")
@@ -298,7 +298,7 @@ def upload_progress(current, total, user_id):
         progress_data[user_id].update({
             'progress': round(progress, 1),
             'speed': format_speed(speed),
-            'eta': str(timedelta(seconds=int((total - current)/speed)) if speed > 0 else '00:00',
+            'eta': str(timedelta(seconds=int((total - current)/speed))) if speed > 0 else '00:00',
             'bar': '●' * int(progress//10) + '◌' * (10 - int(progress//10))
         })
     except:
@@ -324,5 +324,5 @@ def download_thumbnail(url, user_id):
 
 if __name__ == "__main__":
     os.makedirs("dl", exist_ok=True)
-    print("הבוט פועל...")
+    print("🔥 הבוט פועל וממתין לבקשות...")
     app.run()
