@@ -1,221 +1,264 @@
+# main.py
 import os
-import logging
+import re
 import time
-import asyncio
+import json
+import logging
+import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Union
+
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import BadRequest
-from ffmpeg import input as ffmpeg_input, probe
-from dotenv import load_dotenv
-from aiohttp import web
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
+from pyrogram.enums import ParseMode
 
-load_dotenv()
-
-# ========= הגדרות לוג מתקדמות =========
+# הגדרות לוג
 logging.basicConfig(
     level=logging.INFO,
-    format='✨ [%(asctime)s] ▸ %(levelname)s ▸ %(message)s ✨',
-    datefmt='%d/%m/%Y %H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot_activity.log')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
-# ========= הגדרות אפליקציה =========
-app = Client(
-    "ULTIMATE_CONVERTER_BOT",
-    api_id=os.getenv("API_ID"),
-    api_hash=os.getenv("API_HASH"),
-    bot_token=os.getenv("BOT_TOKEN")
-)
+# טעינת משתני סביבה
+API_ID = int(os.environ.get("API_ID", 12345))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# ========= קבועים גלובליים =========
-THUMBNAILS_DIR = Path("thumbnails")
-THUMBNAILS_DIR.mkdir(exist_ok=True)
-TEMP_DIR = Path("temp")
-TEMP_DIR.mkdir(exist_ok=True)
+# יצירת תיקיות נחוצות
+Path("downloads").mkdir(exist_ok=True)
+Path("thumbnails").mkdir(exist_ok=True)
 
-user_data: Dict[int, dict] = {}
+class Database:
+    def __init__(self):
+        self.file_path = "data.json"
+        self.data = self._load_data()
 
-SUPPORTED_VIDEO = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
-SUPPORTED_AUDIO = {'.mp3', '.wav', '.ogg', '.flac'}
+    def _load_data(self) -> Dict:
+        if not os.path.exists(self.file_path):
+            return {"users": {}}
+        with open(self.file_path, "r") as f:
+            return json.load(f)
 
-# ========= פונקציות עזר מעוצבות =========
+    def _save(self):
+        with open(self.file_path, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def save_thumbnail(self, user_id: int, file_id: str):
+        self.data["users"].setdefault(str(user_id), {})["thumbnail"] = file_id
+        self._save()
+
+    def get_thumbnail(self, user_id: int) -> Union[str, None]:
+        return self.data["users"].get(str(user_id), {}).get("thumbnail")
+
+    def delete_thumbnail(self, user_id: int):
+        if str(user_id) in self.data["users"]:
+            self.data["users"][str(user_id)].pop("thumbnail", None)
+            self._save()
+
+    def add_active_task(self, user_id: int, message_id: int):
+        self.data["users"].setdefault(str(user_id), {})["active_task"] = message_id
+        self._save()
+
+    def delete_active_task(self, user_id: int):
+        if str(user_id) in self.data["users"]:
+            self.data["users"][str(user_id)].pop("active_task", None)
+            self._save()
+
+db = Database()
+
+app = Client("file_converter_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# ================= פונקציות עזר =================
 def humanbytes(size: int) -> str:
-    """ממיר בייטים לפורמט קריא עם אימוג'ים"""
-    UNITS = ["B", "KB", "MB", "GB", "TB"]
-    for unit in UNITS:
-        if size < 1024:
-            return f"📦 {size:.2f} {unit}"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size)
+    i = 0
+    while size >= 1024 and i < len(units)-1:
         size /= 1024
-    return f"📦 {size:.2f} TB"
+        i += 1
+    return f"{size:.2f} {units[i]}"
 
-def progress_bar(percentage: float) -> str:
-    """פס התקדמות אנימציוני"""
-    filled = '🟪'
-    empty = '⬜'
-    bars = 10
-    filled_bars = int(percentage // (100/bars))
-    return f"{filled * filled_bars}{empty * (bars - filled_bars)} {percentage:.1f}%"
-
-async def generate_thumbnail(video_path: Path) -> Optional[Path]:
-    """מייצר תמונה ממוזערת אוטומטית מהוידאו"""
-    try:
-        output_path = TEMP_DIR / f"thumb_{time.time()}.jpg"
-        (
-            ffmpeg_input(str(video_path), ss='00:00:01')
-            .output(str(output_path), vframes=1)
-            .run(quiet=True, overwrite_output=True)
-        )
-        return output_path
-    except Exception as e:
-        logging.error(f"שגיאת יצירת תמונה: {e}")
-        return None
-
-# ========= מערכת ניהול קבצים =========
-class FileManager:
-    @staticmethod
-    async def cleanup(user_id: int):
-        """מנקה קבצים זמניים"""
-        if user_id in user_data:
-            for path in user_data[user_id].get('temp_files', []):
-                try:
-                    Path(path).unlink()
-                except:
-                    pass
-            del user_data[user_id]
-
-    @staticmethod
-    def add_temp_file(user_id: int, path: str):
-        """מוסיף קובץ זמני למעקב"""
-        if user_id not in user_data:
-            user_data[user_id] = {'temp_files': []}
-        user_data[user_id]['temp_files'].append(path)
-
-# ========= הודעות מעוצבות =========
-class FancyMessages:
-    @staticmethod
-    async def send_progress(
-        message: Message,
-        operation: str,
-        current: int,
-        total: int,
-        start_time: float
-    ) -> None:
-        """שולח הודעת התקדמות מעוצבת"""
-        elapsed = time.time() - start_time
-        speed = current / elapsed if elapsed > 0 else 0
-        eta = (total - current) / speed if speed > 0 else 0
-        
-        text = (
-            f"🚀 **{operation} מתבצעת**\n\n"
-            f"{progress_bar(current*100/total)}\n\n"
-            f"⚡ **מהירות:** {humanbytes(speed)}/s\n"
-            f"⏳ **זמן משוער:** {time.strftime('%M:%S', time.gmtime(eta))}\n"
-            f"📊 **גודל כולל:** {humanbytes(total)}"
-        )
-        
-        try:
-            await message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚫 ביטול פעולה", callback_data="cancel_operation")]
-                ])
-            )
-        except BadRequest:
-            pass
-
-# ========= Handlers מעוצבים =========
-@app.on_message(filters.command("start"))
-async def start(client: Client, message: Message):
-    """הודעת פתיחה אפית"""
-    await message.reply_text(
-        "🎬 **ברוך הבא לבוט ההמרות המתקדם!**\n\n"
-        "העלה כל קובץ ואני אמיר אותו בצורה המושלמת!\n"
-        "מתאים לווידאו, אודיו ומסמכים עם עיצוב מדהים!",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("התחל המרה 🚀", callback_data="start_conversion")],
-            [InlineKeyboardButton("⚙️ הגדרות", callback_data="settings")]
-        ])
+async def progress_bar(current: int, total: int, start_time: float) -> str:
+    elapsed = time.time() - start_time
+    speed = current / elapsed if elapsed > 0 else 0
+    percent = current * 100 / total
+    filled = int(20 * percent // 100)
+    bar = '●' * filled + '◌' * (20 - filled)
+    
+    speed_str = f"{humanbytes(speed)}/s" if speed > 0 else "0 B/s"
+    eta = (total - current) / speed if speed > 0 else 0
+    
+    return (
+        f"[{bar}] {percent:.2f}%\n"
+        f"**מהירות:** {speed_str}\n"
+        f"**זמן משוער:** {eta:.1f}s"
     )
 
-@app.on_message(filters.document | filters.video | filters.audio)
-async def handle_file(client: Client, message: Message):
-    """מטפל בקבצים עם סגנון"""
-    user_id = message.from_user.id
-    file = message.video or message.document or message.audio
-    
-    # איפוס נתונים קודמים
-    await FileManager.cleanup(user_id)
-    
-    user_data[user_id] = {
-        'file_id': file.file_id,
-        'original_name': file.file_name,
-        'media_type': 'video' if message.video else 'audio' if message.audio else 'document',
-        'start_time': time.time(),
-        'thumb': None
-    }
-    
-    await message.reply_text(
-        "📁 **קובץ התקבל!**\n"
-        "מה תרצה לעשות?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎞️ המר לפורמט אחר", callback_data="convert")],
-            [InlineKeyboardButton("🖼️ הוסף תמונה ממוזערת", callback_data="add_thumb")],
-            [InlineKeyboardButton("❌ ביטול", callback_data="cancel")]
-        ])
-    )
-
-@app.on_callback_query(filters.regex("convert"))
-async def convert_file(client: Client, query: CallbackQuery):
-    """המרת קובץ עם אנימציות"""
-    user_id = query.from_user.id
-    await query.answer()
-    
-    progress_msg = await query.message.reply("⚡ **מתחיל בעיבוד...**")
-    file_path = await client.download_media(
-        user_data[user_id]['file_id'],
-        progress=lambda c, t: FancyMessages.send_progress(progress_msg, "הורדה", c, t, user_data[user_id]['start_time'])
-    )
-    
-    # המרה בפועל
-    converted_path = await process_media(Path(file_path))
-    
-    # שליחה בחזרה עם עיצוב
-    await client.send_document(
-        chat_id=user_id,
-        document=str(converted_path),
-        thumb=str(user_data[user_id].get('thumb', '')),
-        caption="✅ **הקובץ המומר מוכן!**"
-    )
-    
-    # ניקוי
-    await FileManager.cleanup(user_id)
-
-async def process_media(file_path: Path) -> Path:
-    """מעבד את הקובץ עם ffmpeg"""
-    output_path = TEMP_DIR / f"converted_{time.time()}{file_path.suffix}"
-    (
-        ffmpeg_input(str(file_path))
-        .output(str(output_path), vcodec='copy', acodec='copy')
-        .run(quiet=True, overwrite_output=True)
-    )
+def generate_thumbnail(video_path: str, user_id: int):
+    output_path = f"thumbnails/{user_id}.jpg"
+    subprocess.run([
+        "ffmpeg",
+        "-i", video_path,
+        "-ss", "00:00:01",
+        "-vframes", "1",
+        "-vf", "scale=320:-1",
+        output_path
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return output_path
 
-# ========= הרצת השרת =========
-async def run_web_server():
-    app_web = web.Application()
-    app_web.router.add_get('/health', lambda r: web.Response(text="🟢 מערכת פעילה!"))
-    runner = web.AppRunner(app_web)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8000)
-    await site.start()
+# ================= האנדלרים =================
+@app.on_message(filters.command("start"))
+async def start(client: Client, message: Message):
+    await message.reply_text("👋 שלום! שלח לי קובץ או וידאו כדי להתחיל")
+
+@app.on_message(filters.command("view_thumb"))
+async def view_thumb(client: Client, message: Message):
+    thumb = db.get_thumbnail(message.from_user.id)
+    if thumb:
+        await client.send_photo(message.chat.id, thumb, caption="📷 התמונה הממוזערת שלך")
+    else:
+        await message.reply_text("❌ אין תמונה ממוזערת שמורה")
+
+@app.on_message(filters.command("del_thumb"))
+async def del_thumb(client: Client, message: Message):
+    db.delete_thumbnail(message.from_user.id)
+    await message.reply_text("✅ התמונה הממוזערת נמחקה")
+
+@app.on_message(filters.photo)
+async def save_thumbnail(client: Client, message: Message):
+    db.save_thumbnail(message.from_user.id, message.photo.file_id)
+    await message.reply_text("✅ תמונה ממוזערת נשמרה בהצלחה")
+
+@app.on_message(filters.document | filters.video)
+async def handle_file(client: Client, message: Message):
+    user_id = message.from_user.id
+    if db.data["users"].get(str(user_id), {}).get("active_task"):
+        return await message.reply_text("⚠️ יש לך משימה פעילה, נא להמתין לסיומה")
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ שנה שם", callback_data="rename_yes"),
+         InlineKeyboardButton("🚫 המשך ללא שינוי", callback_data="rename_no")]
+    ])
+    
+    msg = await message.reply_text(
+        "📁 האם ברצונך לשנות את שם הקובץ?",
+        reply_markup=keyboard
+    )
+    db.add_active_task(user_id, msg.id)
+
+@app.on_callback_query(filters.regex(r"^rename_(yes|no)"))
+async def rename_choice(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    action = query.data.split("_")[1]
+    
+    await query.message.delete()
+    db.delete_active_task(user_id)
+    
+    if action == "yes":
+        await query.message.reply("✍️ שלח את השם החדש עבור הקובץ:")
+        try:
+            name_msg = await client.listen(user_id, filters.text, timeout=30)
+            new_name = name_msg.text
+            await name_msg.delete()
+        except TimeoutError:
+            return await query.message.reply_text("⌛ זמן ההמתנה עבר")
+        
+        # שמירת השם החדש למשתמש
+        db.data["users"].setdefault(str(user_id), {})["new_name"] = new_name
+        db._save()
+        
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎥 וידאו", callback_data="upload_video"),
+        [InlineKeyboardButton("📁 קובץ", callback_data="upload_file")]
+    ])
+    await query.message.reply_text(
+        "📤 בחר פורמט העלאה:",
+        reply_markup=keyboard
+    )
+
+@app.on_callback_query(filters.regex(r"^upload_(video|file)"))
+async def upload_file(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    upload_type = query.data.split("_")[1]
+    
+    # הורדת הקובץ המקורי
+    original_msg = query.message.reply_to_message
+    file = original_msg.video or original_msg.document
+    
+    start_time = time.time()
+    progress_msg = await query.message.reply_text("⬇️ מתחיל בהורדה...")
+    
+    download_path = await client.download_media(
+        file.file_id,
+        file_name=f"downloads/{file.file_id}",
+        progress=progress_callback,
+        progress_args=(start_time, progress_msg, "download")
+    )
+    
+    # עיבוד הקובץ
+    if upload_type == "video":
+        # יצירת תמונה ממוזערת
+        thumb_path = db.get_thumbnail(user_id) or generate_thumbnail(download_path, user_id)
+        
+        # המרה עם ffmpeg
+        output_path = f"converted_{file.file_id}.mp4"
+        subprocess.run([
+            "ffmpeg",
+            "-i", download_path,
+            "-c", "copy",
+            output_path
+        ], check=True)
+        
+        # העלאת הוידאו
+        await client.send_video(
+            chat_id=user_id,
+            video=output_path,
+            thumb=thumb_path,
+            progress=progress_callback,
+            progress_args=(start_time, progress_msg, "upload")
+        )
+    else:
+        # העלאת כקובץ רגיל
+        await client.send_document(
+            chat_id=user_id,
+            document=download_path,
+            progress=progress_callback,
+            progress_args=(start_time, progress_msg, "upload")
+        )
+    
+    # ניקוי קבצים
+    os.remove(download_path)
+    if upload_type == "video":
+        os.remove(output_path)
+
+async def progress_callback(current: int, total: int, start_time: float, message: Message, action: str):
+    progress = await progress_bar(current, total, start_time)
+    text = (
+        f"**{'⬇️ מוריד' if action == 'download' else '⬆️ מעלה'} את הקובץ**\n\n"
+        f"**גודל קובץ:** {humanbytes(total)}\n"
+        f"{progress}"
+    )
+    
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ בטל", callback_data="cancel")]])
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בעדכון התקדמות: {e}")
+
+@app.on_callback_query(filters.regex("^cancel"))
+async def cancel_process(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    db.delete_active_task(user_id)
+    await query.message.edit_text("❌ הפעולה בוטלה!")
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_web_server())
     app.run()
