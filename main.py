@@ -69,7 +69,7 @@ async def handle_file(client: Client, message: Message):
         "האם ברצונך לשנות את שם הקובץ?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("שנה שם", callback_data="rename_yes"),
-            InlineKeyboardButton("לא לשנות", callback_data="rename_no")],
+             InlineKeyboardButton("לא לשנות", callback_data="rename_no")],
             [InlineKeyboardButton("ביטול פעולה", callback_data="cancel")]
         ])
     )
@@ -93,6 +93,7 @@ async def handle_rename(client: Client, query: CallbackQuery):
         msg = await query.message.reply(
             "📝 אנא שלח את השם החדש לקובץ:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול", callback_data="cancel")]])
+        )
         user_data[user_id]["messages_to_delete"].append(msg.id)
         return
 
@@ -110,8 +111,10 @@ async def ask_upload_type(user_id: int):
             chat_id=user_id,
             text=f"📁 שם קובץ: {file_name}\n\nבחר פורמט העלאה:",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎥 וידאו", callback_data="upload_video"),
-                [InlineKeyboardButton("📄 קובץ", callback_data="upload_file")],
+                [
+                    InlineKeyboardButton("🎥 וידאו", callback_data="upload_video"),
+                    InlineKeyboardButton("📄 קובץ", callback_data="upload_file")
+                ],
                 [InlineKeyboardButton("ביטול", callback_data="cancel")]
             ])
         )
