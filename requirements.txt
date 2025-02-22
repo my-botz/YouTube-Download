@@ -1,4 +1,4 @@
 pyrogram==2.0.106
-yt-dlp==2023.7.6
+yt-dlp==2023.11.16
 requests==2.31.0
 python-dotenv==1.0.0
