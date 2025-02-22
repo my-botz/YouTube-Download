@@ -12,6 +12,7 @@ from yt_dlp import YoutubeDL
 from collections import defaultdict
 import requests
 import subprocess
+from datetime import timedelta
 
 # הגדרות סביבה
 API_ID = int(os.environ.get("API_ID"))
@@ -39,14 +40,19 @@ async def edit_progress_message(chat_id, message_id):
         
         progress = data.get('progress', 0)
         speed = data.get('speed', 'N/A')
+        eta = data.get('eta', 'N/A')
         status = data.get('status', 'Processing...')
         
-        bar = "[" + "█" * int(progress / 10) + " " * (10 - int(progress / 10)) + "]"
+        # יצירת סרגל התקדמות מעוצב
+        filled_blocks = int(progress // 10)
+        empty_blocks = 10 - filled_blocks
+        progress_bar = '●' * filled_blocks + '◌' * empty_blocks
+        
         text = (
             f"**{status}**\n\n"
-            f"{bar} {progress}%\n"
-            f"**Speed:** {speed}/s\n"
-            f"**ETA:** {data.get('eta', 'N/A')}"
+            f"`[{progress_bar}]` **{progress:.1f}%**\n"
+            f"**מהירות:** `{speed}`\n"
+            f"**זמן משוער:** `{eta}`"
         )
         
         try:
@@ -58,6 +64,13 @@ async def edit_progress_message(chat_id, message_id):
             )
         except:
             pass
+
+def format_speed(speed):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if speed < 1024:
+            return f"{speed:.2f} {unit}/s"
+        speed /= 1024
+    return f"{speed:.2f} GB/s"
 
 def download_thumbnail(url, video_id):
     path = f"{video_id}.jpg"
@@ -100,6 +113,21 @@ def get_ydl_opts(format_id, media_type):
     
     return opts
 
+@app.on_message(filters.command("start"))
+async def start_command(client: Client, message: Message):
+    user = message.from_user
+    start_text = (
+        f"היי {user.first_name} 👋\n"
+        "אני בוט להורדת מדיה מיוטיוב!\n\n"
+        "**איך להשתמש:**\n"
+        "1. שלח לי קישור ליוטיוב\n"
+        "2. בחר פורמט (אודיו/וידאו)\n"
+        "3. בחר איכות\n"
+        "4. המתן עד לסיום העיבוד\n\n"
+        "הבוט תומך בכל האיכויות כולל 4K!"
+    )
+    await message.reply(start_text)
+
 @app.on_message(filters.text & filters.private)
 async def handle_message(client: Client, message: Message):
     url = re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message.text)
@@ -141,23 +169,30 @@ async def handle_callback(client: Client, query: CallbackQuery):
         
         formats = []
         if data == 'audio':
-            audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+            audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
             formats = sorted(
-                {f['format_note']: f for f in audio_formats}.values(),
-                key=lambda x: x.get('abr', 0),
+                audio_formats,
+                key=lambda x: x.get('abr', 0) or x.get('tbr', 0),
                 reverse=True
             )
         else:
-            video_formats = [f for f in info['formats'] if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
+            video_formats = [f for f in info['formats'] if f.get('vcodec') != 'none']
             formats = sorted(
-                {f['format_note']: f for f in video_formats}.values(),
-                key=lambda x: x.get('height', 0),
+                video_formats,
+                key=lambda x: x.get('height', 0) or x.get('width', 0),
                 reverse=True
             )
         
+        # סינון פורמטים כפולים
+        unique_formats = {}
+        for fmt in formats:
+            key = fmt.get('format_note') or fmt.get('height') or fmt.get('abr')
+            if key and key not in unique_formats:
+                unique_formats[key] = fmt
+        
         buttons = []
-        for fmt in formats[:5]:
-            quality = fmt['format_note'] or f"{fmt.get('height', '?')}p"
+        for fmt in list(unique_formats.values())[:8]:
+            quality = fmt.get('format_note') or f"{fmt.get('height', '?')}p" or f"{fmt.get('abr', 0)}kbps"
             buttons.append([InlineKeyboardButton(
                 f"🎚 {quality}",
                 callback_data=f"quality_{fmt['format_id']}_{data}"
@@ -178,10 +213,11 @@ async def handle_callback(client: Client, query: CallbackQuery):
         
         progress_data[(chat_id, message_id)] = {
             'progress': 0,
-            'status': 'Downloading...',
-            'speed': '0B',
-            'eta': 'N/A',
-            'completed': False
+            'status': 'מוריד...',
+            'speed': '0B/s',
+            'eta': '00:00',
+            'completed': False,
+            'start_time': time.time()
         }
         
         Thread(target=lambda: asyncio.run(edit_progress_message(chat_id, message_id))).start()
@@ -203,13 +239,25 @@ async def handle_callback(client: Client, query: CallbackQuery):
                     convert_to_mp3(file_path, new_path, thumbnail_path)
                     file_path = new_path
             
-            progress_data[(chat_id, message_id)]['status'] = 'Uploading...'
+            progress_data[(chat_id, message_id)]['status'] = 'מעלה...'
+            
+            # יצירת כיתוב עם פרטים
+            duration = str(timedelta(seconds=info.get('duration', 0)))
+            caption = (
+                f"🎵 **{info['title']}**\n"
+                f"⏳ **משך:** `{duration}`\n"
+                f"📤 **הועלה ע\"י:** @{(await app.get_me()).username}"
+            )
             
             if media_type == 'audio':
                 await app.send_audio(
                     chat_id,
                     file_path,
                     thumb=thumbnail_path,
+                    caption=caption,
+                    duration=info.get('duration'),
+                    performer=info.get('uploader'),
+                    title=info.get('title'),
                     progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
                 )
             else:
@@ -217,6 +265,10 @@ async def handle_callback(client: Client, query: CallbackQuery):
                     chat_id,
                     file_path,
                     thumb=thumbnail_path,
+                    caption=caption,
+                    duration=info.get('duration'),
+                    width=info.get('width'),
+                    height=info.get('height'),
                     progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
                 )
             
@@ -232,20 +284,27 @@ async def handle_callback(client: Client, query: CallbackQuery):
 
 def update_progress(d, chat_id, message_id):
     if d['status'] == 'downloading':
-        progress = d.get('_percent_str', '0%').strip('%')
+        progress = float(d.get('_percent_str', '0%').strip('%'))
+        elapsed = time.time() - progress_data[(chat_id, message_id)]['start_time']
+        speed = d.get('_speed_str', '0B').split(' ')[0]
+        eta = d.get('_eta_str', '0')
+        
         progress_data[(chat_id, message_id)].update({
-            'progress': float(progress),
-            'speed': d.get('_speed_str', 'N/A'),
-            'eta': d.get('_eta_str', 'N/A')
+            'progress': progress,
+            'speed': speed + "/s",
+            'eta': eta if eta.isdigit() else '00:00'
         })
 
 def upload_progress(current, total, chat_id, message_id):
     progress = (current / total) * 100
-    speed = current / (time.time() - progress_data[(chat_id, message_id)].get('start_time', time.time()))
+    elapsed = time.time() - progress_data[(chat_id, message_id)]['start_time']
+    speed = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
+    
     progress_data[(chat_id, message_id)].update({
-        'progress': round(progress, 1),
-        'speed': f"{speed / 1024 / 1024:.2f}MB",
-        'status': 'Uploading...'
+        'progress': progress,
+        'speed': format_speed(speed),
+        'eta': str(timedelta(seconds=int(eta))).split('.')[0]
     })
 
 if __name__ == "__main__":
