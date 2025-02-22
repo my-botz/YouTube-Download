@@ -199,7 +199,7 @@ async def ask_upload_type(client: Client, message: Message, user_id: int):
     )
     db.add_active_task(user_id, msg.id)
 
-@app.on_message(filters.text & ~filters.command() & filters.private)
+@app.on_message(filters.text & ~filters.command(None) & filters.private)
 async def handle_new_name(client: Client, message: Message):
     user_id = message.from_user.id
     
