@@ -2,7 +2,9 @@ import os
 import re
 import time
 import asyncio
-from threading import Thread
+import shutil
+import string
+from threading import Lock
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup,
@@ -22,341 +24,305 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # אתחול הבוט
 app = Client(
-    "my_bot",
+    "yt_dl_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-# מאגר נתונים זמני
-user_data = defaultdict(dict)
+# ניהול משאבים
+user_locks = defaultdict(Lock)
+active_tasks = {}
 progress_data = defaultdict(dict)
 
-async def edit_progress_message(chat_id, message_id):
+# פונקציות עזר
+def sanitize_filename(name):
+    valid_chars = f"-_.() {string.ascii_letters}{string.digits}"
+    return ''.join(c for c in name if c in valid_chars).strip()[:50]
+
+async def edit_progress(chat_id, message_id):
     while True:
         await asyncio.sleep(3)
         data = progress_data.get((chat_id, message_id))
-        if not data or data.get('completed'):
+        if not data or data.get('done'):
             break
         
-        progress = data.get('progress', 0)
-        speed = data.get('speed', 'N/A')
-        eta = data.get('eta', 'N/A')
-        status = data.get('status', 'Processing...')
-        phase = data.get('phase', 'download')
-        
-        filled = int(progress // 10)
-        progress_bar = '●' * filled + '◌' * (10 - filled)
-        
-        text = (
-            f"**{status}**\n\n"
-            f"`[{progress_bar}]` **{progress:.1f}%**\n"
-            f"**מהירות:** `{speed}`\n"
-            f"**זמן משוער:** `{eta}`\n"
-            f"**שלב:** `{phase.capitalize()}`"
-        )
-        
         try:
+            text = (
+                f"**{data['status']}**\n\n"
+                f"`[{data['bar']}]` **{data['progress']}%**\n"
+                f"**מהירות:** `{data['speed']}`\n"
+                f"**זמן משוער:** `{data['eta']}`\n"
+                f"**שלב:** `{data['phase'].capitalize()}`"
+            )
             await app.edit_message_text(
-                chat_id,
-                message_id,
-                text,
-                reply_markup=data.get('reply_markup')
+                chat_id, message_id, text, 
+                reply_markup=data.get('markup')
             )
         except:
             pass
 
 def format_speed(speed):
-    units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
-    unit_index = 0
-    while speed >= 1024 and unit_index < 3:
-        speed /= 1024
-        unit_index += 1
-    return f"{speed:.2f} {units[unit_index]}"
-
-def download_thumbnail(url, video_id):
     try:
-        path = f"{video_id}.jpg"
-        with open(path, 'wb') as f:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            f.write(response.content)
-        return path
+        units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
+        speed = float(speed)
+        for i, unit in enumerate(units):
+            if speed < 1024 or i == len(units)-1:
+                return f"{speed:.2f} {unit}"
+            speed /= 1024
     except:
-        return download_thumbnail(f"https://img.youtube.com/vi/{video_id}/default.jpg", video_id)
+        return "0B/s"
 
-def convert_to_mp3(input_file, output_file, thumbnail, metadata):
-    subprocess.run([
-        'ffmpeg',
-        '-i', input_file,
-        '-i', thumbnail,
-        '-map', '0:0',
-        '-map', '1:0',
-        '-id3v2_version', '3',
-        '-metadata', f"title={metadata['title']}",
-        '-metadata', f"artist={metadata['artist']}",
-        '-metadata', 'comment=Uploaded by YouTube Bot',
-        '-codec:a', 'libmp3lame',
-        '-q:a', '0',
-        output_file
-    ], capture_output=True)
-
-def get_ydl_opts(format_id, media_type):
+def get_ydl_opts(user_id, media_type):
     opts = {
-        'format': format_id,
-        'progress_hooks': [],
-        'postprocessors': [],
-        'outtmpl': '%(id)s.%(ext)s',
+        'outtmpl': f'dl/{user_id}/%(title)s.%(ext)s',
+        'progress_hooks': [lambda d: progress_hook(d, user_id)],
         'noplaylist': True,
+        'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
         'verbose': False
     }
     
-    if os.path.exists('cookies.txt'):
-        opts['cookiefile'] = 'cookies.txt'
-        opts['mark_watched'] = False
-    
     if media_type == 'audio':
-        opts['postprocessors'].append({
+        opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '320',
-        })
-    
+            'preferredquality': '320'
+        }]
     return opts
 
+def progress_hook(d, user_id):
+    try:
+        data = progress_data[user_id]
+        if d['status'] == 'downloading':
+            data.update({
+                'status': 'מוריד מהיוטיוב',
+                'phase': 'download',
+                'progress': float(d['_percent_str'].strip('%')),
+                'speed': format_speed(d['_speed_str'].split(' ')[0]),
+                'eta': str(timedelta(seconds=int(d['_eta_str']))),
+                'bar': '●' * int(d['_percent_str'].strip('%')//10) + '◌' * (10 - int(d['_percent_str'].strip('%')//10))
+            })
+    except Exception as e:
+        print(f"Progress error: {e}")
+
+# מטפל בפקודות
 @app.on_message(filters.command(["start", "help"]))
-async def start_command(client: Client, message: Message):
-    user = message.from_user
-    start_text = (
-        f"👋 שלום {user.mention}!\n"
-        "אני בוט להורדת מדיה מיוטיוב עם תמיכה בכל האיכויות!\n\n"
-        "📚 **איך להשתמש:**\n"
-        "1. שלח לי קישור יוטיוב\n"
-        "2. אבחר את הפורמט הרצוי\n"
-        "3. בחר איכות\n"
-        "4. המתן לסיום העיבוד\n\n"
-        "🎧 עבור אודיו - אספק קובץ MP3 באיכות גבוהה\n"
-        "🎥 עבור וידאו - אספק קובץ MP4 עד 4K\n\n"
-        "🕒 זמן עיבוד ממוצע: 1-5 דקות תלוי בגודל"
+async def start(client, message):
+    text = (
+        "👋 שלום! אני בוט להורדת מדיה מיוטיוב\n"
+        "📤 שלחו לי קישור ואבחר לכם אפשרויות הורדה\n"
+        "⚡ תמיכה באודיו (MP3) ווידאו עד 4K"
     )
-    await message.reply(start_text)
+    await message.reply(text)
 
 @app.on_message(filters.text & filters.private)
-async def handle_message(client: Client, message: Message):
-    url_match = re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message.text)
-    if not url_match:
+async def handle_url(client, message):
+    user_id = message.from_user.id
+    
+    if not user_locks[user_id].acquire(blocking=False):
+        await message.reply("⏳ יש להמתין לסיום הפעולה הנוכחית!")
         return
     
-    checking_msg = await message.reply("🔍 בודק את הקישור...")
-    
     try:
-        url = url_match.group(1)
-        user_id = message.from_user.id
-        user_data[user_id]['url'] = url
+        url = re.findall(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message.text)[0]
+        msg = await message.reply("🔍 בודק קישור...")
         
-        ydl_opts = {'quiet': True, 'extract_flat': True}
-        if os.path.exists('cookies.txt'):
-            ydl_opts['cookiefile'] = 'cookies.txt'
-        
-        with YoutubeDL(ydl_opts) as ydl:
+        with YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
         
-        await checking_msg.delete()
-        
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 מוזיקה (MP3)", callback_data="audio"),
-            InlineKeyboardButton("🎥 וידאו (MP4)", callback_data="video")]
+            [
+                InlineKeyboardButton("🎵 אודיו", callback_data=f"type_audio_{user_id}"),
+                InlineKeyboardButton("🎥 וידאו", callback_data=f"type_video_{user_id}")
+            ]
         ])
-        
-        msg = await message.reply(
-            "📂 **בחר פורמט להורדה:**",
-            reply_markup=keyboard
-        )
-        user_data[user_id]['format_message'] = msg.id
+        await msg.edit("📥 בחרו פורמט:", reply_markup=keyboard)
     
     except Exception as e:
-        await checking_msg.edit(f"❌ שגיאה: {str(e)}")
+        await message.reply(f"❌ שגיאה: {str(e)}")
+    finally:
+        user_locks[user_id].release()
 
 @app.on_callback_query()
-async def handle_callback(client: Client, query: CallbackQuery):
+async def handle_callback(client, query):
     user_id = query.from_user.id
     data = query.data
     
-    if data in ['audio', 'video']:
-        url = user_data[user_id].get('url')
-        if not url:
-            await query.answer("❌ שגיאה, נסה שוב!")
-            return
-        
-        checking_msg = await query.message.edit("🔍 מאתר איכויות זמינות...")
-        
-        try:
-            ydl_opts = {'quiet': True, 'extract_flat': True}
-            if os.path.exists('cookies.txt'):
-                ydl_opts['cookiefile'] = 'cookies.txt'
-            
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            
-            formats = []
-            if data == 'audio':
-                audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
-                formats = sorted(
-                    audio_formats,
-                    key=lambda x: x.get('abr', 0) or x.get('tbr', 0),
-                    reverse=True
-                )
-            else:
-                video_formats = [f for f in info['formats'] if f.get('vcodec') != 'none']
-                formats = sorted(
-                    video_formats,
-                    key=lambda x: (x.get('height', 0), x.get('tbr', 0)),
-                    reverse=True
-                )
-            
-            unique_formats = {}
-            for fmt in formats:
-                quality = None
-                if data == 'audio':
-                    quality = f"{fmt.get('abr', 0)}kbps"
-                else:
-                    quality = f"{fmt.get('height', '?')}p"
-                
-                if quality and quality not in unique_formats:
-                    unique_formats[quality] = fmt
-            
-            buttons = []
-            for quality, fmt in list(unique_formats.items())[:8]:
-                buttons.append([InlineKeyboardButton(
-                    f"🎚 {quality}",
-                    callback_data=f"quality_{fmt['format_id']}_{data}"
-                )])
-            
-            await checking_msg.edit(
-                "📊 **בחר איכות:**",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-        
-        except Exception as e:
-            await checking_msg.edit(f"❌ שגיאה: {str(e)}")
+    if not user_locks[user_id].acquire(blocking=False):
+        await query.answer("⏳ יש להמתין לסיום הפעולה הנוכחית!", show_alert=True)
+        return
     
-    elif data.startswith('quality_'):
-        _, format_id, media_type = data.split('_')
-        url = user_data[user_id].get('url')
+    try:
+        if data.startswith('type_'):
+            media_type = data.split('_')[1]
+            await process_media_type(query, media_type, user_id)
         
-        progress_msg = await query.message.edit("⏳ מתחיל בעיבוד...")
-        chat_id = progress_msg.chat.id
-        message_id = progress_msg.id
+        elif data.startswith('quality_'):
+            await process_quality(query, user_id)
         
-        progress_data[(chat_id, message_id)] = {
+        elif data == 'cancel':
+            await cancel_task(user_id, query.message)
+            
+    except Exception as e:
+        await query.message.reply(f"❌ שגיאה: {str(e)}")
+    finally:
+        user_locks[user_id].release()
+
+async def process_media_type(query, media_type, user_id):
+    try:
+        url = re.findall(r'(https?://\S+)', query.message.reply_to_message.text)[0]
+        msg = await query.message.edit("🔍 מאתר איכויות...")
+        
+        with YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        
+        formats = sorted(
+            [f for f in info['formats'] if media_type == 'audio' else [f for f in info['formats'] if f.get('vcodec') != 'none'],
+            key=lambda x: x.get('abr', 0) if media_type == 'audio' else x.get('height', 0),
+            reverse=True
+        )
+        
+        buttons = []
+        for fmt in formats[:5]:
+            quality = f"{fmt['abr']}kbps" if media_type == 'audio' else f"{fmt['height']}p"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🎚 {quality}",
+                    callback_data=f"quality_{fmt['format_id']}_{media_type}_{user_id}"
+                )
+            ])
+        
+        buttons.append([InlineKeyboardButton("🚫 ביטול", callback_data="cancel")])
+        await msg.edit(
+            "📊 בחרו איכות:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    
+    except Exception as e:
+        await query.message.reply(f"❌ שגיאה: {str(e)}")
+
+async def process_quality(query, user_id):
+    try:
+        _, format_id, media_type, uid = query.data.split('_')
+        url = re.findall(r'(https?://\S+)', query.message.reply_to_message.text)[0]
+        
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 ביטול", callback_data="cancel")]])
+        msg = await query.message.edit("⏳ מתחיל בעיבוד...", reply_markup=markup)
+        
+        progress_data[user_id] = {
+            'status': 'מתחיל...',
             'progress': 0,
-            'status': 'מתחיל הורדה',
             'speed': '0B/s',
             'eta': '00:00',
-            'phase': 'download',
-            'completed': False,
-            'start_time': time.time()
+            'phase': 'init',
+            'bar': '◌'*10,
+            'done': False,
+            'markup': markup
         }
         
-        Thread(target=lambda: asyncio.run(edit_progress_message(chat_id, message_id))).start()
+        task = asyncio.create_task(download_and_send(
+            url, format_id, media_type, user_id, msg
+        ))
+        active_tasks[user_id] = task
         
-        try:
-            video_id = re.search(r'v=([\w-]+)', url).group(1)
-            thumbnail_path = download_thumbnail(f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg", video_id)
-            
-            ydl_opts = get_ydl_opts(format_id, media_type)
-            ydl_opts['progress_hooks'] = [lambda d: update_progress(d, chat_id, message_id)]
-            
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                file_path = ydl.prepare_filename(info)
-                
-                if media_type == 'audio':
-                    new_path = f"{video_id}.mp3"
-                    metadata = {
-                        'title': info.get('title', 'Unknown'),
-                        'artist': info.get('uploader', 'Unknown')
-                    }
-                    convert_to_mp3(file_path, new_path, thumbnail_path, metadata)
-                    file_path = new_path
-            
-            progress_data[(chat_id, message_id)].update({
-                'status': 'מתחיל העלאה',
-                'phase': 'upload',
-                'progress': 0
-            })
-            
-            duration = str(timedelta(seconds=info.get('duration', 0)))
-            caption = (
-                f"🎬 **{info['title']}**\n"
-                f"⏱ **משך:** `{duration}`\n"
-                f"📤 **הועלה ע\"י:** @{(await app.get_me()).username}"
-            )
-            
-            mime_type = mimetypes.guess_type(file_path)[0]
-            if media_type == 'audio':
-                await app.send_audio(
-                    chat_id,
-                    file_path,
-                    thumb=thumbnail_path,
-                    caption=caption,
-                    duration=info.get('duration'),
-                    performer=info.get('uploader'),
-                    title=info.get('title'),
-                    mime_type=mime_type,
-                    progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
-                )
-            else:
-                await app.send_video(
-                    chat_id,
-                    file_path,
-                    thumb=thumbnail_path,
-                    caption=caption,
-                    duration=info.get('duration'),
-                    width=info.get('width'),
-                    height=info.get('height'),
-                    mime_type=mime_type,
-                    progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
-                )
-            
-            progress_data[(chat_id, message_id)]['completed'] = True
-            await query.message.delete()
-            
-        except Exception as e:
-            await query.message.edit(f"❌ שגיאה קריטית: {str(e)}")
-        
-        for f in [file_path, thumbnail_path]:
-            try: os.remove(f)
-            except: pass
-
-def update_progress(d, chat_id, message_id):
-    if d['status'] == 'downloading':
-        progress = float(d.get('_percent_str', '0%').strip('%'))
-        speed = d.get('_speed_str', '0B').split(' ')[0]
-        eta = d.get('_eta_str', '0')
-        
-        progress_data[(chat_id, message_id)].update({
-            'progress': progress,
-            'speed': format_speed(float(speed)),
-            'eta': str(timedelta(seconds=int(eta))) if eta.isdigit() else '00:00',
-            'status': 'מוריד מהיוטיוב',
-            'phase': 'download'
-        })
-
-def upload_progress(current, total, chat_id, message_id):
-    progress = (current / total) * 100
-    elapsed = time.time() - progress_data[(chat_id, message_id)]['start_time']
-    speed = current / elapsed if elapsed > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
+        await asyncio.gather(task, edit_progress(msg.chat.id, msg.id))
     
-    progress_data[(chat_id, message_id)].update({
-        'progress': progress,
-        'speed': format_speed(speed),
-        'eta': str(timedelta(seconds=int(eta))).split('.')[0],
-        'status': 'מעלה לטלגרם',
-        'phase': 'upload'
-    })
+    except Exception as e:
+        await query.message.reply(f"❌ שגיאה: {str(e)}")
+
+async def download_and_send(url, format_id, media_type, user_id, msg):
+    try:
+        # הורדה
+        opts = get_ydl_opts(user_id, media_type)
+        opts['format'] = format_id
+        
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
+        
+        # המרה והעלאה
+        sanitized = sanitize_filename(info['title'])
+        output_path = f"dl/{user_id}/{sanitized}.{media_type}"
+        os.rename(file_path, output_path)
+        
+        # העלאה
+        await upload_file(output_path, media_type, info, user_id, msg)
+        
+    except asyncio.CancelledError:
+        await msg.edit("❌ הפעולה בוטלה!")
+        raise
+    except Exception as e:
+        await msg.edit(f"❌ שגיאה: {str(e)}")
+    finally:
+        progress_data[user_id]['done'] = True
+        shutil.rmtree(f"dl/{user_id}", ignore_errors=True)
+        active_tasks.pop(user_id, None)
+
+async def upload_file(path, media_type, info, user_id, msg):
+    try:
+        caption = f"🎬 {info['title']}\n📤 הועלה ע\"י @{(await app.get_me()).username}"
+        thumb = download_thumbnail(info['thumbnail'], user_id)
+        
+        progress_data[user_id].update({
+            'status': 'מעלה לטלגרם',
+            'phase': 'upload'
+        })
+        
+        if media_type == 'audio':
+            await app.send_audio(
+                msg.chat.id, path,
+                caption=caption,
+                thumb=thumb,
+                progress=upload_progress,
+                progress_args=(user_id,)
+            )
+        else:
+            await app.send_video(
+                msg.chat.id, path,
+                caption=caption,
+                thumb=thumb,
+                progress=upload_progress,
+                progress_args=(user_id,)
+            )
+        
+        await msg.delete()
+    except Exception as e:
+        await msg.edit(f"❌ שגיאה בהעלאה: {str(e)}")
+
+def upload_progress(current, total, user_id):
+    try:
+        progress = (current / total) * 100
+        elapsed = time.time() - progress_data[user_id]['start']
+        speed = current / elapsed if elapsed > 0 else 0
+        
+        progress_data[user_id].update({
+            'progress': round(progress, 1),
+            'speed': format_speed(speed),
+            'eta': str(timedelta(seconds=int((total - current)/speed)) if speed > 0 else '00:00',
+            'bar': '●' * int(progress//10) + '◌' * (10 - int(progress//10))
+        })
+    except:
+        pass
+
+async def cancel_task(user_id, msg):
+    task = active_tasks.get(user_id)
+    if task:
+        task.cancel()
+        await msg.edit("❌ הפעולה בוטלה!")
+    else:
+        await msg.edit("⚠️ אין פעולה פעילה לביטול!")
+
+def download_thumbnail(url, user_id):
+    try:
+        path = f"dl/{user_id}/thumb.jpg"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(requests.get(url).content)
+        return path
+    except:
+        return None
 
 if __name__ == "__main__":
-    print("הבוט מתחיל...")
+    os.makedirs("dl", exist_ok=True)
+    print("הבוט פועל...")
     app.run()
