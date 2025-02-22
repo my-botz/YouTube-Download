@@ -1,230 +1,269 @@
 import os
-import re
+import logging
 import asyncio
+from pathlib import Path
+from typing import Dict, Optional
 from pyrogram import Client, filters
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup,
-    InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import BadRequest
+from ffmpeg import input as ffmpeg_input
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-from yt_dlp import YoutubeDL
-from collections import defaultdict
-import requests
-import subprocess
 
-# ================= CONFIG ================= #
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-COOKIES_FILE = "cookies.txt"
-PORT = int(os.environ.get("PORT", 8080))
+app = Client(
+    "file_converter_bot",
+    api_id=os.getenv("API_ID"),
+    api_hash=os.getenv("API_HASH"),
+    bot_token=os.getenv("BOT_TOKEN")
+)
 
-# ================= SETUP ================= #
-app = Client("yt_bot", API_ID, API_HASH, bot_token=BOT_TOKEN)
-user_data = defaultdict(dict)
+THUMBNAILS_DIR = "thumbnails"
+Path(THUMBNAILS_DIR).mkdir(exist_ok=True)
 
-# ================= UTILS ================= #
-def escape_markdown(text):
-    return re.sub(r"([_*\[\]()~`>\#\+\-=\|{}\.!])", r"\\\1", text) if text else ""
+user_data: Dict[int, dict] = {}
 
-async def download_thumbnail(url, filename):
-    try:
-        response = await asyncio.to_thread(requests.get, url, timeout=10)
-        if response.status_code == 200:
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            return filename
-    except Exception as e:
-        print(f"Thumbnail error: {e}")
-    return None
+def is_busy(user_id: int) -> bool:
+    return user_data.get(user_id, {}).get('busy', False)
 
-async def cleanup_files(*files):
-    for file in files:
-        if file and os.path.exists(file):
-            try: os.remove(file)
-            except: pass
+async def cleanup_user_data(user_id: int):
+    if user_id in user_data:
+        del user_data[user_id]
 
-# ================= PROGRESS HANDLERS ================= #
-async def progress_updater(chat_id, message_id, total, downloaded, start_time):
-    while True:
-        await asyncio.sleep(5)
-        try:
-            elapsed = time.time() - start_time
-            speed = (downloaded / elapsed) if elapsed > 0 else 0
-            percent = (downloaded / total) * 100 if total > 0 else 0
-            
-            progress_bar = "[" + "●" * int(percent // 10) + "◌" * (10 - int(percent // 10)) + "]"
-            text = (
-                f"**{'⬇️ מוריד' if total > downloaded else '⬆️ מעלה'}**\n\n"
-                f"{progress_bar} **{percent:.1f}%**\n"
-                f"**מהירות:** {speed/1024/1024:.2f}MB/s\n"
-                f"**זמן משוער:** {timedelta(seconds=int((total - downloaded)/speed)) if speed > 0 else 'N/A'}"
-            )
-            await app.edit_message_text(chat_id, message_id, text)
-        except:
-            break
+@app.on_message(filters.command("start"))
+async def start(client: Client, message: Message):
+    start_text = (
+        "👋 שלום! אני בוט להמרת קבצים\n\n"
+        "✅ אפשרויות עיקריות:\n"
+        "- המרת קבצים לוידאו/מסמך\n"
+        "- שינוי שם קבצים\n"
+        "- ניהול תמונות ממוזערות\n\n"
+        "📌 פקודות חשובות:\n"
+        "/view_thumb - הצג תמונה ממוזערת\n"
+        "/del_thumb - מחק תמונה ממוזערת\n\n"
+        "⚠️ העלאה מרבית: 2GB"
+    )
+    await message.reply_text(start_text)
 
-# ================= HANDLERS ================= #
-@app.on_message(filters.command(["start", "help"]))
-async def start(_, msg):
-    start_text = """
-    🎉 **ברוכים הבאים לבוט היוטיוב!** 🚀
-    📤 שלחו לי קישור יוטיוב ואני:
-    1. אוריד את המדיה באיכות הגבוהה ביותר
-    2. אמיר לכם אותה ישירות לטלגרם!
-    """
-    await msg.reply(start_text)
+@app.on_message(filters.document | filters.video)
+async def handle_file(client: Client, message: Message):
+    user_id = message.from_user.id
+    if is_busy(user_id):
+        return await message.reply("⚠️ יש להשלים את הפעולה הנוכחית לפני תחילת פעולה חדשה")
 
-@app.on_message(filters.text & filters.private)
-async def handle_url(_, msg):
-    url_match = re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', msg.text)
-    if not url_match:
-        return await msg.reply("❌ **קישור לא תקין** - שלח קישור יוטיוב תקני")
-    
-    user_id = msg.from_user.id
-    user_data[user_id] = {'url': url_match.group()}
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎵 אודיו MP3", callback_data="audio"),
-         InlineKeyboardButton("🎥 וידאו MP4", callback_data="video")]
-    ])
-    
-    await msg.reply("📥 **בחר פורמט הורדה:**", reply_markup=keyboard)
+    file = message.video or message.document
+    user_data[user_id] = {
+        "busy": True,
+        "file_id": file.file_id,
+        "original_name": file.file_name,
+        "media_type": "video" if message.video else "document",
+        "messages_to_delete": [message.id]
+    }
 
-@app.on_callback_query()
-async def handle_query(_, query):
+    await message.reply_text(
+        "האם ברצונך לשנות את שם הקובץ?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("שנה שם", callback_data="rename_yes"),
+            InlineKeyboardButton("לא לשנות", callback_data="rename_no")],
+            [InlineKeyboardButton("ביטול פעולה", callback_data="cancel")]
+        ])
+    )
+
+@app.on_callback_query(filters.regex(r"^rename_(yes|no|cancel)$"))
+async def handle_rename(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    data = query.data
+    action = query.data.split("_")[1]
+
+    await query.answer()
+    await query.message.delete()
+
+    if action == "cancel":
+        await cleanup_user_data(user_id)
+        return await query.message.reply("❌ הפעולה בוטלה")
+
+    if action == "no":
+        user_data[user_id]["new_filename"] = user_data[user_id]["original_name"]
     
-    if data == 'cancel':
-        await query.message.edit("❌ **הפעולה בוטלה!**")
+    if action == "yes":
+        msg = await query.message.reply(
+            "📝 אנא שלח את השם החדש לקובץ:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול", callback_data="cancel")]])
+        user_data[user_id]["messages_to_delete"].append(msg.id)
         return
+
+    await ask_upload_type(user_id)
+
+async def ask_upload_type(user_id: int):
+    user = user_data.get(user_id)
+    if not user:
+        return
+
+    file_name = user.get("new_filename", user["original_name"])
     
-    if data in ['audio', 'video']:
-        url = user_data.get(user_id, {}).get('url')
-        if not url:
-            return await query.answer("❌ שגיאה - נסה שוב מההתחלה")
-        
-        try:
-            ydl_opts = {'quiet': True, 'cookiefile': COOKIES_FILE}
-            info = await asyncio.to_thread(YoutubeDL(ydl_opts).extract_info, url, download=False)
-            
-            formats = sorted(
-                info['formats'],
-                key=lambda x: x.get('abr' if data == 'audio' else 'height', 0),
-                reverse=True
-            )[:5]
-            
-            buttons = []
-            for fmt in formats:
-                quality = f"{fmt['abr']}kbps" if data == 'audio' else f"{fmt['height']}p"
-                buttons.append([InlineKeyboardButton(
-                    f"🎚 {quality}", 
-                    callback_data=f"dl_{data}_{fmt['format_id']}"
-                )])
-            
-            buttons.append([InlineKeyboardButton("🚫 ביטול", callback_data="cancel")])
-            safe_title = escape_markdown(info.get('title', 'ללא כותרת'))
-            await query.message.edit(
-                f"**{safe_title}**\n\n📊 **בחר איכות:**",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-        
-        except Exception as e:
-            await query.message.edit(f"❌ **שגיאה**: {escape_markdown(str(e))}")
+    try:
+        msg = await app.send_message(
+            chat_id=user_id,
+            text=f"📁 שם קובץ: {file_name}\n\nבחר פורמט העלאה:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎥 וידאו", callback_data="upload_video"),
+                [InlineKeyboardButton("📄 קובץ", callback_data="upload_file")],
+                [InlineKeyboardButton("ביטול", callback_data="cancel")]
+            ])
+        )
+        user["messages_to_delete"].append(msg.id)
+    except Exception as e:
+        logging.error(f"Error asking upload type: {e}")
+        await cleanup_user_data(user_id)
 
-    elif data.startswith('dl_'):
-        media_type, format_id = data.split('_')[1:]
-        url = user_data[user_id]['url']
-        msg = await query.message.edit("⏳ **מתחיל בעיבוד...**")
-        
-        try:
-            # התחלת מעקב התקדמות
-            progress_task = None
-            start_time = time.time()
-            
-            # הגדרות הורדה
-            ydl_opts = {
-                'format': f'{format_id}+bestaudio' if media_type == 'video' else format_id,
-                'cookiefile': COOKIES_FILE,
-                'outtmpl': '%(title)s.%(ext)s',
-                'postprocessors': [
-                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}
-                ] if media_type == 'audio' else [],
-                'noplaylist': True,
-                'writethumbnail': True
-            }
-            
-            # הורדה
-            with YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-                file_path = ydl.prepare_filename(info)
-                
-                # מעקב התקדמות
-                total_size = info.get('filesize', 0)
-                progress_task = asyncio.create_task(
-                    progress_updater(msg.chat.id, msg.id, total_size, 0, start_time)
-                )
-                
-                # המרה לאודיו
-                if media_type == 'audio':
-                    mp3_path = f"{os.path.splitext(file_path)[0]}.mp3"
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        ['ffmpeg', '-i', file_path, '-b:a', '320k', mp3_path],
-                        check=True
-                    )
-                    file_path = mp3_path
-            
-            # הכנת קבצים
-            thumb_path = f"{os.path.splitext(file_path)[0]}.jpg"
-            if not os.path.exists(thumb_path) and info.get('thumbnail'):
-                await download_thumbnail(info['thumbnail'], thumb_path)
-            
-            # עדכון הודעה
-            await msg.edit("📤 **מעלה לטלגרם...**")
-            
-            # שליחת המדיה
-            caption = f"🎬 **{escape_markdown(info['title'])}**\n⬆️ הועלה ע\"י @{(await app.get_me()).username}"
-            if media_type == 'audio':
-                await app.send_audio(
-                    msg.chat.id,
-                    file_path,
-                    caption=caption,
-                    thumb=thumb_path,
-                    duration=info.get('duration'),
-                    performer=info.get('uploader', 'Unknown')
-                )
-            else:
-                await app.send_video(
-                    msg.chat.id,
-                    file_path,
-                    caption=caption,
-                    thumb=thumb_path,
-                    duration=info.get('duration'),
-                    width=info.get('width'),
-                    height=info.get('height'),
-                    supports_streaming=True
-                )
-            
-            await msg.delete()
-        
-        except Exception as e:
-            await msg.edit(f"❌ **שגיאה**: {escape_markdown(str(e))}")
-        finally:
-            if progress_task:
-                progress_task.cancel()
-            await cleanup_files(file_path, thumb_path)
+@app.on_message(filters.private & filters.text & ~filters.command("start|view_thumb|del_thumb"))
+async def handle_filename(client: Client, message: Message):
+    user_id = message.from_user.id
+    if not is_busy(user_id):
+        return
 
-# ================= HEALTH CHECK ================= #
-from flask import Flask
-server = Flask(__name__)
+    user_data[user_id]["new_filename"] = message.text
+    user_data[user_id]["messages_to_delete"].append(message.id)
 
-@server.route('/')
-def health_check():
-    return "Bot is running", 200
+    try:
+        await client.delete_messages(
+            chat_id=user_id,
+            message_ids=user_data[user_id]["messages_to_delete"]
+        )
+    except Exception as e:
+        logging.error(f"Error deleting messages: {e}")
+
+    await ask_upload_type(user_id)
+
+@app.on_callback_query(filters.regex(r"^upload_(video|file|cancel)$"))
+async def handle_upload(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    action = query.data.split("_")[1]
+
+    await query.answer()
+    await query.message.delete()
+
+    if action == "cancel":
+        await cleanup_user_data(user_id)
+        return await query.message.reply("❌ הפעולה בוטלה")
+
+    user = user_data.get(user_id)
+    if not user:
+        return
+
+    try:
+        file_path = await client.download_media(user["file_id"])
+        processed_path = await process_media(file_path, user_id, action)
+
+        thumbnail_path = f"{THUMBNAILS_DIR}/{user_id}.jpg"
+        if not os.path.exists(thumbnail_path) and action == "video":
+            thumbnail_path = await generate_thumbnail(file_path)
+
+        upload_args = {
+            "chat_id": user_id,
+            "file_name": user.get("new_filename", user["original_name"]),
+            "thumb": thumbnail_path if action == "video" else None
+        }
+
+        if action == "video":
+            await client.send_video(video=processed_path, **upload_args)
+        else:
+            await client.send_document(document=processed_path, **upload_args)
+
+        await query.message.reply("✅ הקובץ הועלה בהצלחה!")
+    except Exception as e:
+        logging.error(f"Upload error: {e}")
+        await query.message.reply("❌ שגיאה בעיבוד הקובץ")
+    finally:
+        await cleanup_user_data(user_id)
+        for path in [file_path, processed_path]:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                logging.error(f"Error cleaning files: {e}")
+
+async def process_media(file_path: str, user_id: int, media_type: str) -> str:
+    if media_type == "video":
+        output_path = f"processed_{user_id}.mp4"
+        probe = ffmpeg.probe(file_path)
+        duration = int(float(probe['format']['duration']))
+        
+        (
+            ffmpeg_input(file_path)
+            .output(output_path, vcodec='copy', acodec='copy')
+            .run(overwrite_output=True)
+        )
+        return output_path
+    return file_path
+
+async def generate_thumbnail(video_path: str) -> Optional[str]:
+    try:
+        thumbnail_path = f"thumbnail_{os.path.basename(video_path)}.jpg"
+        (
+            ffmpeg_input(video_path, ss='00:00:00')
+            .output(thumbnail_path, vframes=1)
+            .run(overwrite_output=True)
+        )
+        return thumbnail_path
+    except Exception as e:
+        logging.error(f"Thumbnail error: {e}")
+        return None
+
+@app.on_message(filters.command("view_thumb"))
+async def view_thumbnail(client: Client, message: Message):
+    user_id = message.from_user.id
+    thumbnail_path = f"{THUMBNAILS_DIR}/{user_id}.jpg"
+    
+    if os.path.exists(thumbnail_path):
+        await message.reply_photo(
+            thumbnail_path,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("מחק תמונה", callback_data="delete_thumb")]
+            ])
+        )
+    else:
+        await message.reply_text("לא נמצאה תמונה ממוזערת")
+
+@app.on_message(filters.command("del_thumb"))
+async def delete_thumbnail_cmd(client: Client, message: Message):
+    user_id = message.from_user.id
+    thumbnail_path = f"{THUMBNAILS_DIR}/{user_id}.jpg"
+    
+    try:
+        os.remove(thumbnail_path)
+        await message.reply_text("✅ תמונה ממוזערת נמחקה")
+    except FileNotFoundError:
+        await message.reply_text("❌ לא נמצאה תמונה למחיקה")
+    except Exception as e:
+        await message.reply_text(f"❌ שגיאה במחיקה: {str(e)}")
+
+@app.on_callback_query(filters.regex("delete_thumb"))
+async def delete_thumbnail(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    thumbnail_path = f"{THUMBNAILS_DIR}/{user_id}.jpg"
+    
+    try:
+        os.remove(thumbnail_path)
+        await query.answer("✅ תמונה נמחקה")
+        await query.message.edit_text("תמונה ממוזערת נמחקה")
+    except Exception as e:
+        await query.answer(f"❌ שגיאה: {str(e)}")
+
+@app.on_message(filters.photo & filters.private)
+async def save_thumbnail(client: Client, message: Message):
+    user_id = message.from_user.id
+    thumbnail_path = f"{THUMBNAILS_DIR}/{user_id}.jpg"
+    
+    try:
+        await client.download_media(message.photo.file_id, file_name=thumbnail_path)
+        await message.reply_text("✅ תמונה ממוזערת נשמרה!")
+    except Exception as e:
+        await message.reply_text(f"❌ שגיאה בשמירת תמונה: {str(e)}")
 
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=server.run, kwargs={'host': '0.0.0.0', 'port': PORT}).start()
-    print("🤖 הבוט פועל בהצלחה!")
     app.run()
