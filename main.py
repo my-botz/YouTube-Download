@@ -15,7 +15,6 @@ from collections import defaultdict
 import requests
 import subprocess
 from datetime import timedelta
-import mimetypes
 
 # הגדרות סביבה
 API_ID = int(os.environ.get("API_ID"))
@@ -94,13 +93,17 @@ def progress_hook(d, user_id):
     try:
         data = progress_data[user_id]
         if d['status'] == 'downloading':
+            percent = float(d['_percent_str'].strip('%'))
+            eta = str(timedelta(seconds=int(d['_eta_str']))) if d['_eta_str'].isdigit() else '00:00'
+            bar = '●' * int(percent // 10) + '◌' * (10 - int(percent // 10))
+            
             data.update({
                 'status': 'מוריד מהיוטיוב',
                 'phase': 'download',
-                'progress': float(d['_percent_str'].strip('%')),
+                'progress': percent,
                 'speed': format_speed(d['_speed_str'].split(' ')[0]),
-                'eta': str(timedelta(seconds=int(d['_eta_str'])) if d['_eta_str'].isdigit() else '00:00',
-                'bar': '●' * int(float(d['_percent_str'].strip('%'))//10 + '◌' * (10 - int(float(d['_percent_str'].strip('%'))//10)
+                'eta': eta,
+                'bar': bar
             })
     except Exception as e:
         print(f"Progress error: {e}")
@@ -176,11 +179,13 @@ async def process_media_type(query, media_type, user_id):
         with YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
         
-        formats = sorted(
-            [f for f in info['formats'] if media_type == 'audio' else [f for f in info['formats'] if f.get('vcodec') != 'none'],
-            key=lambda x: x.get('abr', 0) if media_type == 'audio' else x.get('height', 0),
-            reverse=True
-        )
+        formats = []
+        if media_type == 'audio':
+            formats = [f for f in info['formats'] if f.get('acodec') != 'none']
+            formats = sorted(formats, key=lambda x: x.get('abr', 0), reverse=True)
+        else:
+            formats = [f for f in info['formats'] if f.get('vcodec') != 'none']
+            formats = sorted(formats, key=lambda x: x.get('height', 0), reverse=True)
         
         buttons = []
         for fmt in formats[:5]:
@@ -273,16 +278,14 @@ async def upload_file(path, media_type, info, user_id, msg):
                 msg.chat.id, path,
                 caption=caption,
                 thumb=thumb,
-                progress=upload_progress,
-                progress_args=(user_id,)
+                progress=lambda c, t: upload_progress(c, t, user_id)
             )
         else:
             await app.send_video(
                 msg.chat.id, path,
                 caption=caption,
                 thumb=thumb,
-                progress=upload_progress,
-                progress_args=(user_id,)
+                progress=lambda c, t: upload_progress(c, t, user_id)
             )
         
         await msg.delete()
@@ -292,7 +295,7 @@ async def upload_file(path, media_type, info, user_id, msg):
 def upload_progress(current, total, user_id):
     try:
         progress = (current / total) * 100
-        elapsed = time.time() - progress_data[user_id]['start']
+        elapsed = time.time() - progress_data[user_id].get('start', time.time())
         speed = current / elapsed if elapsed > 0 else 0
         
         progress_data[user_id].update({
@@ -324,5 +327,5 @@ def download_thumbnail(url, user_id):
 
 if __name__ == "__main__":
     os.makedirs("dl", exist_ok=True)
-    print("🔥 הבוט פועל וממתין לבקשות...")
+    print("🚀 הבוט פועל וממתין לבקשות!")
     app.run()
