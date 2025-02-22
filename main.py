@@ -16,21 +16,20 @@ import subprocess
 # הגדרות סביבה
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
-SESSION_STRING = os.environ.get("SESSION_STRING")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# אתחול הקליינט
+# אתחול הבוט
 app = Client(
     "my_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING
+    bot_token=BOT_TOKEN
 )
 
 # מאגר נתונים זמני
 user_data = defaultdict(dict)
 progress_data = defaultdict(dict)
 
-# פונקציות עזר
 async def edit_progress_message(chat_id, message_id):
     while True:
         await asyncio.sleep(5)
@@ -81,7 +80,26 @@ def convert_to_mp3(input_file, output_file, thumbnail):
         output_file
     ], capture_output=True)
 
-# מטפל בהודעות
+def get_ydl_opts(format_id, media_type):
+    opts = {
+        'format': format_id,
+        'progress_hooks': [],
+        'postprocessors': [],
+        'outtmpl': '%(id)s.%(ext)s',
+    }
+    
+    if os.path.exists('cookies.txt'):
+        opts['cookiefile'] = 'cookies.txt'
+    
+    if media_type == 'audio':
+        opts['postprocessors'].append({
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        })
+    
+    return opts
+
 @app.on_message(filters.text & filters.private)
 async def handle_message(client: Client, message: Message):
     url = re.search(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)', message.text)
@@ -103,7 +121,6 @@ async def handle_message(client: Client, message: Message):
     )
     user_data[user_id]['format_message'] = msg.id
 
-# מטפל בבחירת פורמט
 @app.on_callback_query()
 async def handle_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
@@ -116,6 +133,9 @@ async def handle_callback(client: Client, query: CallbackQuery):
             return
         
         ydl_opts = {'quiet': True, 'extract_flat': True}
+        if os.path.exists('cookies.txt'):
+            ydl_opts['cookiefile'] = 'cookies.txt'
+        
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         
@@ -164,28 +184,15 @@ async def handle_callback(client: Client, query: CallbackQuery):
             'completed': False
         }
         
-        # התחל עדכון התקדמות
-        Thread(target=lambda: asyncio.run(edit_progress_message(chat_id, message_id)).start()
+        Thread(target=lambda: asyncio.run(edit_progress_message(chat_id, message_id))).start()
         
-        # הורדה ועיבוד
         try:
             video_id = re.search(r'v=([\w-]+)', url).group(1)
             thumbnail_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
             thumbnail_path = download_thumbnail(thumbnail_url, video_id)
             
-            ydl_opts = {
-                'format': format_id,
-                'outtmpl': f'{video_id}.%(ext)s',
-                'progress_hooks': [lambda d: update_progress(d, chat_id, message_id)],
-                'postprocessors': []
-            }
-            
-            if media_type == 'audio':
-                ydl_opts['postprocessors'].append({
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                })
+            ydl_opts = get_ydl_opts(format_id, media_type)
+            ydl_opts['progress_hooks'] = [lambda d: update_progress(d, chat_id, message_id)]
             
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -196,35 +203,29 @@ async def handle_callback(client: Client, query: CallbackQuery):
                     convert_to_mp3(file_path, new_path, thumbnail_path)
                     file_path = new_path
             
-            # עדכן הודעה לפני העלאה
             progress_data[(chat_id, message_id)]['status'] = 'Uploading...'
             
-            # העלה לטלגרם
             if media_type == 'audio':
                 await app.send_audio(
                     chat_id,
                     file_path,
                     thumb=thumbnail_path,
-                    progress=upload_progress,
-                    progress_args=(chat_id, message_id)
+                    progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
                 )
             else:
                 await app.send_video(
                     chat_id,
                     file_path,
                     thumb=thumbnail_path,
-                    progress=upload_progress,
-                    progress_args=(chat_id, message_id)
+                    progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
                 )
             
-            # סיום
             progress_data[(chat_id, message_id)]['completed'] = True
             await query.message.delete()
             
         except Exception as e:
             await query.message.edit(f"שגיאה: {str(e)}")
         
-        # נקה קבצים
         for f in [file_path, thumbnail_path]:
             try: os.remove(f)
             except: pass
