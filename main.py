@@ -45,7 +45,6 @@ async def edit_progress_message(chat_id, message_id):
         status = data.get('status', 'Processing...')
         phase = data.get('phase', 'download')
         
-        # יצירת סרגל התקדמות עם סמלים ייחודיים
         filled = int(progress // 10)
         progress_bar = '●' * filled + '◌' * (10 - filled)
         
@@ -236,7 +235,8 @@ async def handle_callback(client: Client, query: CallbackQuery):
             await checking_msg.edit(
                 "📊 **בחר איכות:**",
                 reply_markup=InlineKeyboardMarkup(buttons)
-            
+            )
+        
         except Exception as e:
             await checking_msg.edit(f"❌ שגיאה: {str(e)}")
     
@@ -305,6 +305,7 @@ async def handle_callback(client: Client, query: CallbackQuery):
                     title=info.get('title'),
                     mime_type=mime_type,
                     progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
+                )
             else:
                 await app.send_video(
                     chat_id,
@@ -316,6 +317,7 @@ async def handle_callback(client: Client, query: CallbackQuery):
                     height=info.get('height'),
                     mime_type=mime_type,
                     progress=lambda c, t: upload_progress(c, t, chat_id, message_id)
+                )
             
             progress_data[(chat_id, message_id)]['completed'] = True
             await query.message.delete()
