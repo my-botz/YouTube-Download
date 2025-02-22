@@ -1,7 +1,6 @@
 import os
 import logging
 import time
-import math
 import asyncio
 from pathlib import Path
 from typing import Dict, Optional
@@ -29,56 +28,87 @@ app = Client(
     bot_token=os.getenv("BOT_TOKEN")
 )
 
-# הגדרות כללים
+# משתנים גלובליים
 THUMBNAILS_DIR = "thumbnails"
 Path(THUMBNAILS_DIR).mkdir(exist_ok=True)
 user_data: Dict[int, dict] = {}
 
-# שרת HTTP לבריאות
-async def health_check(request):
-    return web.Response(text="OK")
+# הרחבות נתמכות
+VIDEO_EXTS = {'.mp4', '.avi', '.mkv', '.mov', '.webm'}
+AUDIO_EXTS = {'.mp3', '.wav', '.ogg', '.flac'}
 
-@ app.on_message(filters.command("start"))
+# ========= פונקציות עזר =========
+def humanbytes(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if size < 1024:
+            break
+        size /= 1024
+    return f"{size:.2f} {unit}"
+
+def human_time(seconds: int) -> str:
+    periods = [('שעה', 3600), ('דקה', 60), ('שניות', 1)]
+    result = []
+    for period_name, period_seconds in periods:
+        if seconds >= period_seconds:
+            period_value, seconds = divmod(seconds, period_seconds)
+            result.append(f"{int(period_value)} {period_name}")
+    return ' '.join(result) if result else '0 שניות'
+
+def progress_bar(percentage: float) -> str:
+    filled = '●'
+    empty = '○'
+    total_bars = 12
+    filled_bars = round(percentage / 100 * total_bars)
+    return f"[{filled * filled_bars}{empty * (total_bars - filled_bars)}] {percentage:.2f}%"
+
+def process_filename(new_name: str, original_name: str, media_type: str) -> str:
+    original_ext = os.path.splitext(original_name)[1].lower()
+    name_part, ext_part = os.path.splitext(new_name)
+    ext_part = ext_part.lower()
+    
+    if media_type == 'video':
+        if ext_part in AUDIO_EXTS:
+            return f"{name_part}.mp4"
+        if not ext_part or ext_part not in VIDEO_EXTS:
+            return f"{name_part}{original_ext if original_ext in VIDEO_EXTS else '.mp4'}"
+    else:
+        if not ext_part:
+            return f"{new_name}{original_ext}"
+    return new_name
+
+# ========= handlers =========
+@app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    welcome_text = """
-    🌟 **ברוך הבא לבוט ההמרות!** 🌟
-
-    כאן תוכל:
-    ▸ להמיר קבצים בין פורמטים
-    ▸ לשנות שמות קבצים
-    ▸ לנהל תמונות ממוזערות
-
+    start_text = """
+    🎥 **ברוך הבא לבוט המרת הקבצים!**
+    
+    ▸ העלה קובץ וידאו/מסמך
+    ▸ שנה שם ופורמט לפי בחירה
+    ▸ ניהול תמונות ממוזערות
+    
     📜 **פקודות זמינות:**
-    /start - תפריט ראשי
     /view_thumb - הצג תמונה ממוזערת
     /del_thumb - מחק תמונה ממוזערת
     /cancel - ביטול פעולה נוכחית
-
-    ⚡ **גודל מקסימלי:** 2GB
     """
     await message.reply_text(
-        welcome_text,
+        start_text,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("התחל המרה 🚀", callback_data="start_conversion")]
         ])
     )
 
-@ app.on_callback_query(filters.regex("^start_conversion$"))
-async def start_conversion(client: Client, query: CallbackQuery):
-    await query.answer()
-    await query.message.delete()
-    await query.message.reply("📤 אנא שלח קובץ להמרה:")
-
-@ app.on_message(filters.command("cancel"))
+@app.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in user_data:
         await cleanup_user_data(user_id)
-        await message.reply("✅ כל הפעולות בוטלו בהצלחה!")
+        await message.reply("✅ כל הפעולות בוטלו!")
     else:
         await message.reply("ℹ️ אין פעולות פעילות לביטול")
 
-@ app.on_message(filters.document | filters.video)
+@app.on_message(filters.document | filters.video)
 async def handle_file(client: Client, message: Message):
     user_id = message.from_user.id
     
@@ -109,7 +139,7 @@ async def handle_file(client: Client, message: Message):
         ])
     )
 
-@ app.on_callback_query(filters.regex(r"^rename_(yes|no|cancel)$"))
+@app.on_callback_query(filters.regex(r"^rename_(yes|no|cancel)$"))
 async def handle_rename(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
     action = query.data.split("_")[1]
@@ -122,7 +152,11 @@ async def handle_rename(client: Client, query: CallbackQuery):
         return await query.message.reply("✅ הפעולה בוטלה בהצלחה")
     
     if action == "no":
-        user_data[user_id]["new_filename"] = user_data[user_id]["original_name"]
+        user_data[user_id]["new_filename"] = process_filename(
+            user_data[user_id]['original_name'],
+            user_data[user_id]['original_name'],
+            user_data[user_id]['media_type']
+        )
         await ask_upload_type(user_id)
     else:
         msg = await query.message.reply(
@@ -131,13 +165,19 @@ async def handle_rename(client: Client, query: CallbackQuery):
         )
         user_data[user_id]["messages_to_delete"].append(msg.id)
 
-@ app.on_message(filters.private & filters.text & ~filters.command(["start","view_thumb","del_thumb","cancel"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start","view_thumb","del_thumb","cancel"]))
 async def handle_filename(client: Client, message: Message):
     user_id = message.from_user.id
     if not user_data.get(user_id, {}).get('busy'):
         return
     
-    user_data[user_id]["new_filename"] = message.text
+    processed_name = process_filename(
+        message.text,
+        user_data[user_id]['original_name'],
+        user_data[user_id]['media_type']
+    )
+    
+    user_data[user_id]["new_filename"] = processed_name
     user_data[user_id]["messages_to_delete"].append(message.id)
     
     try:
@@ -161,7 +201,7 @@ async def ask_upload_type(user_id: int):
         
         file_path = await app.download_media(
             user["file_id"],
-            progress=create_progress_callback(progress_msg, "הורדה")
+            progress=lambda current, total: update_progress(current, total, progress_msg, "הורדה")
         )
         
         user["file_path"] = file_path
@@ -174,7 +214,7 @@ async def ask_upload_type(user_id: int):
             ▸ שם: `{user.get('new_filename', user['original_name'])}`
             ▸ גודל: {humanbytes(os.path.getsize(file_path))}
             
-            📤 **בחר פורמט העלאה:**
+            📤 **בחר פורמט יעד:**
             """,
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -190,7 +230,29 @@ async def ask_upload_type(user_id: int):
         await cleanup_user_data(user_id)
         await progress_msg.edit("❌ **שגיאה בהורדת הקובץ**")
 
-@ app.on_callback_query(filters.regex(r"^upload_(video|file|cancel)$"))
+async def update_progress(current: int, total: int, message: Message, operation: str):
+    percent = current * 100 / total
+    bar = progress_bar(percent)
+    speed = humanbytes(current / (time.time() - user_data[message.from_user.id]['start_time']))
+    eta = human_time(int((total - current) / (current / (time.time() - user_data[message.from_user.id]['start_time'])) if current > 0 else 0)
+    
+    text = f"""
+    🚀 **{operation} מתבצעת**
+    
+    {bar}
+    ▸ 📁 שם: `{user_data[message.from_user.id].get('new_filename', 'קובץ')}`
+    ▸ ⚡ מהירות: {speed}/s
+    ▸ 🕒 זמן משוער: {eta}
+    """
+    
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה ❌", callback_data="cancel")]])
+    except BadRequest:
+        pass
+
+@app.on_callback_query(filters.regex(r"^upload_(video|file|cancel)$"))
 async def handle_upload(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
     action = query.data.split("_")[1]
@@ -211,23 +273,24 @@ async def handle_upload(client: Client, query: CallbackQuery):
             user_id,
             "⚡ **מתחיל בעיבוד...**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול העלאה ❌", callback_data="cancel")]])
+        )
         
         file_name = user.get("new_filename", user["original_name"])
+        output_path = await process_media(user["file_path"], user_id, action)
         
         if action == "video":
-            output_path = await process_video(user["file_path"], user_id)
             await app.send_video(
                 user_id,
                 output_path,
                 file_name=file_name,
-                progress=create_progress_callback(progress_msg, "העלאה")
+                progress=lambda current, total: update_progress(current, total, progress_msg, "העלאה")
             )
         else:
             await app.send_document(
                 user_id,
-                user["file_path"],
+                output_path,
                 file_name=file_name,
-                progress=create_progress_callback(progress_msg, "העלאה")
+                progress=lambda current, total: update_progress(current, total, progress_msg, "העלאה")
             )
         
         await progress_msg.delete()
@@ -239,71 +302,21 @@ async def handle_upload(client: Client, query: CallbackQuery):
     finally:
         await cleanup_user_data(user_id)
 
-# פונקציות עזר
-def create_progress_callback(message: Message, operation: str):
-    async def wrapper(current, total):
-        try:
-            await update_progress(
-                current=current,
-                total=total,
-                message=message,
-                operation=operation,
-                file_name="קובץ"
-            )
-        except Exception as e:
-            logging.error(f"שגיאת עדכון התקדמות: {e}")
-    return wrapper
-
-async def update_progress(current: int, total: int, message: Message, operation: str, file_name: str):
-    percent = current * 100 / total
-    bar = f"[{'●' * int(percent//10)}{'○' * (10 - int(percent//10))}]"
-    speed = humanbytes(current / (time.time() - user_data[message.from_user.id]['start_time']))
-    
-    text = f"""
-    🚀 **{operation} מתבצעת**
-    
-    ▸ {bar} {percent:.1f}%
-    ▸ 📁 שם: `{file_name}`
-    ▸ ⚡ מהירות: {speed}/s
-    ▸ 🕒 זמן משוער: {estimate_time(current, total)}
-    """
-    
-    try:
-        await message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה ❌", callback_data="cancel")]])
-    except BadRequest:
-        pass
-
-def estimate_time(current, total):
-    elapsed = time.time() - user_data['start_time']
-    remaining = (total - current) * elapsed / current if current else 0
-    return f"{int(remaining//60)}:{int(remaining%60):02d} דקות"
-
-def humanbytes(size: float) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    for unit in units:
-        if size < 1024:
-            break
-        size /= 1024
-    return f"{size:.2f} {unit}"
-
-# ניהול קבצים
-async def process_video(input_path: str, user_id: int) -> str:
-    output_path = f"processed_{user_id}.mp4"
-    try:
+async def process_media(file_path: str, user_id: int, media_type: str) -> str:
+    if media_type == "video":
+        output_path = f"processed_{user_id}.mp4"
         (
-            ffmpeg_input(input_path)
+            ffmpeg_input(file_path)
             .output(output_path, vcodec='copy', acodec='copy')
             .run(overwrite_output=True)
+        )
         return output_path
-    except Exception as e:
-        logging.error(f"שגיאת עיבוד וידאו: {e}")
-        raise e
+    return file_path
 
 async def cleanup_user_data(user_id: int):
     if user_id in user_data:
-        for path in [user_data[user_id].get('file_path'), user_data[user_id].get('processed_path')]:
+        for path in [user_data[user_id].get('file_path'), 
+                   user_data[user_id].get('processed_path')]:
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
@@ -311,17 +324,20 @@ async def cleanup_user_data(user_id: int):
                 pass
         del user_data[user_id]
 
-# הפעלת שרת בריאות
+# ========= שרת בריאות =========
+async def health_check(request):
+    return web.Response(text="OK")
+
 async def run_server():
-    server = web.Server(health_check)
-    runner = web.ServerRunner(server)
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8000)
     await site.start()
     logging.info("שרת בריאות פועל בפורט 8000")
 
 if __name__ == "__main__":
-    app.start()
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(run_server())
+    loop.create_task(run_server())
     app.run()
