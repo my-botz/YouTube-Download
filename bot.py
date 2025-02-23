@@ -308,7 +308,7 @@ async def my_plan(client: Client, message: Message):
             wait = 0
         plan_info = f"🆓 חינמי. זמינות פעולה: {'מיידית' if wait==0 else f'עוד {wait} שניות'}."
     
-    plans = "תוכניות זמינות:\n1. חינמי - פעולה אחת כל 5 דקות\n2. פרימיום - ללא הגבלות (ניתן לשדרוג ע"י מנהל)"
+    plans = """תוכניות זמינות:\n1. חינמי - פעולה אחת כל 5 דקות\n2. פרימיום - ללא הגבלות (ניתן לשדרוג ע"י מנהל)"""
     await message.reply_text(f"📊 התוכנית שלך:\n{plan_info}\n\n{plans}", reply_to_message_id=message.id)
 
 # ================== פקודות מנהל ==================
