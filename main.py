@@ -160,7 +160,7 @@ async def save_thumbnail(client: Client, message: Message):
     db.save_thumbnail(message.from_user.id, message.photo.file_id)
     await message.reply_text("✅ תמונה ממוזערת נשמרה בהצלחה", reply_to_message_id=message.id)
 
-@app.on_message(filters.document | filters.video))
+@app.on_message(filters.document | filters.video)
 async def handle_file(client: Client, message: Message):
     user_id = message.from_user.id
     if db.data["users"].get(str(user_id), {}).get("active_task"):
