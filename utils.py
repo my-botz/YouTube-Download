@@ -7,7 +7,7 @@ def humanbytes(size: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     size = float(size)
     i = 0
-    while size >= 1024 and i < len(units)-1:
+    while size >= 1024 and i < len(units) - 1:
         size /= 1024
         i += 1
     return f"{size:.2f} {units[i]}"
@@ -41,7 +41,7 @@ def generate_thumbnail(video_path: str, user_id: int) -> str:
     return output_path
 
 def parse_duration(duration_str: str) -> int:
-    # תומך ב-d (ימים), h (שעות), m (דקות)
+    # תומך בפורמטים כמו 20d, 5h, 30m
     unit = duration_str[-1]
     try:
         value = int(duration_str[:-1])
