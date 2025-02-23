@@ -2,4 +2,3 @@ pyrogram==2.0.106
 TgCrypto==1.2.5
 ffmpeg-python==0.2.0
 python-dotenv==0.21.0
-flask==2.0.1
