@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import time
@@ -79,6 +78,13 @@ class Database:
     def is_waiting_for_name(self, user_id: int) -> bool:
         return self.data["users"].get(str(user_id), {}).get("waiting_for_name", False)
 
+    def set_original_message(self, user_id: int, message_id: int):
+        self.data["users"].setdefault(str(user_id), {})["original_msg_id"] = message_id
+        self._save()
+
+    def get_original_message(self, user_id: int) -> Union[int, None]:
+        return self.data["users"].get(str(user_id), {}).get("original_msg_id")
+
 db = Database()
 
 app = Client(
@@ -129,31 +135,39 @@ def generate_thumbnail(video_path: str, user_id: int):
 # ================= האנדלרים =================
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    await message.reply_text("👋 שלום! שלח לי קובץ או וידאו כדי להתחיל")
+    await message.reply_text("👋 שלום! שלח לי קובץ או וידאו כדי להתחיל", reply_to_message_id=message.id)
 
 @app.on_message(filters.command("view_thumb"))
 async def view_thumb(client: Client, message: Message):
     thumb = db.get_thumbnail(message.from_user.id)
     if thumb:
-        await client.send_photo(message.chat.id, thumb, caption="📷 התמונה הממוזערת שלך")
+        await client.send_photo(
+            message.chat.id, 
+            thumb, 
+            caption="📷 התמונה הממוזערת שלך",
+            reply_to_message_id=message.id
+        )
     else:
-        await message.reply_text("❌ אין תמונה ממוזערת שמורה")
+        await message.reply_text("❌ אין תמונה ממוזערת שמורה", reply_to_message_id=message.id)
 
 @app.on_message(filters.command("del_thumb"))
 async def del_thumb(client: Client, message: Message):
     db.delete_thumbnail(message.from_user.id)
-    await message.reply_text("✅ התמונה הממוזערת נמחקה")
+    await message.reply_text("✅ התמונה הממוזערת נמחקה", reply_to_message_id=message.id)
 
-@app.on_message(filters.photo)
+@app.on_message(filters.photo))
 async def save_thumbnail(client: Client, message: Message):
     db.save_thumbnail(message.from_user.id, message.photo.file_id)
-    await message.reply_text("✅ תמונה ממוזערת נשמרה בהצלחה")
+    await message.reply_text("✅ תמונה ממוזערת נשמרה בהצלחה", reply_to_message_id=message.id)
 
-@app.on_message(filters.document | filters.video)
+@app.on_message(filters.document | filters.video))
 async def handle_file(client: Client, message: Message):
     user_id = message.from_user.id
     if db.data["users"].get(str(user_id), {}).get("active_task"):
-        return await message.reply_text("⚠️ יש לך משימה פעילה, נא להמתין לסיומה")
+        return await message.reply_text("⚠️ יש לך משימה פעילה, נא להמתין לסיומה", reply_to_message_id=message.id)
+    
+    db.set_original_message(user_id, message.id)
+    db.delete_active_task(user_id)
     
     keyboard = InlineKeyboardMarkup([
         [
@@ -164,13 +178,15 @@ async def handle_file(client: Client, message: Message):
     
     msg = await message.reply_text(
         "📁 האם ברצונך לשנות את שם הקובץ?",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        reply_to_message_id=message.id
     )
     db.add_active_task(user_id, msg.id)
 
 @app.on_callback_query(filters.regex(r"^rename_(yes|no)"))
 async def rename_choice(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
+    original_msg_id = db.get_original_message(user_id)
     action = query.data.split("_")[1]
     
     try:
@@ -182,12 +198,16 @@ async def rename_choice(client: Client, query: CallbackQuery):
     
     if action == "yes":
         db.set_waiting_for_name(user_id, True)
-        sent_msg = await query.message.reply("✍️ שלח את השם החדש עבור הקובץ:")
+        sent_msg = await client.send_message(
+            chat_id=user_id,
+            text="✍️ שלח את השם החדש עבור הקובץ:",
+            reply_to_message_id=original_msg_id
+        )
         db.add_active_task(user_id, sent_msg.id)
     else:
-        await ask_upload_type(client, query.message, user_id)
+        await ask_upload_type(client, original_msg_id, user_id)
 
-async def ask_upload_type(client: Client, message: Message, user_id: int):
+async def ask_upload_type(client: Client, original_msg_id: int, user_id: int):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎥 וידאו", callback_data="upload_video"),
@@ -195,15 +215,18 @@ async def ask_upload_type(client: Client, message: Message, user_id: int):
         ]
     ])
     
-    msg = await message.reply(
-        "📤 בחר פורמט העלאה:",
-        reply_markup=keyboard
+    msg = await client.send_message(
+        chat_id=user_id,
+        text="📤 בחר פורמט העלאה:",
+        reply_markup=keyboard,
+        reply_to_message_id=original_msg_id
     )
     db.add_active_task(user_id, msg.id)
 
-@app.on_message(filters.text & ~filters.regex(r'^/') & filters.private)
+@app.on_message(filters.text & ~filters.regex(r'^/') & filters.private))
 async def handle_new_name(client: Client, message: Message):
     user_id = message.from_user.id
+    original_msg_id = db.get_original_message(user_id)
     
     if db.is_waiting_for_name(user_id):
         try:
@@ -217,27 +240,32 @@ async def handle_new_name(client: Client, message: Message):
         user_data.pop("waiting_for_name", None)
         db._save()
         
-        await ask_upload_type(client, message, user_id)
+        await ask_upload_type(client, original_msg_id, user_id)
         db.set_waiting_for_name(user_id, False)
 
 @app.on_callback_query(filters.regex(r"^upload_(video|file)"))
 async def upload_file(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
+    original_msg_id = db.get_original_message(user_id)
     upload_type = query.data.split("_")[1]
     
     try:
-        original_msg = query.message.reply_to_message
-        if not original_msg:
-            return await query.answer("❌ שגיאה: הודעה לא נמצאה", show_alert=True)
+        original_msg = await client.get_messages(
+            chat_id=user_id,
+            message_ids=original_msg_id
+        )
         
         file = original_msg.video or original_msg.document
         if not file:
             return await query.answer("❌ קובץ לא נתמך", show_alert=True)
         
         start_time = time.time()
-        progress_msg = await query.message.reply_text("⬇️ מתחיל בהורדה...")
+        progress_msg = await client.send_message(
+            chat_id=user_id,
+            text="⬇️ מתחיל בהורדה...",
+            reply_to_message_id=original_msg_id
+        )
         
-        # הורדת הקובץ
         download_path = await client.download_media(
             file.file_id,
             file_name=f"downloads/{file.file_id}",
@@ -245,15 +273,12 @@ async def upload_file(client: Client, query: CallbackQuery):
             progress_args=(start_time, progress_msg, "download")
         )
         
-        # עיבוד קובץ
         new_name = db.data["users"].get(str(user_id), {}).get("new_name")
         output_path = None
         
         if upload_type == "video":
-            # יצירת תמונה ממוזערת
             thumb_path = db.get_thumbnail(user_id) or generate_thumbnail(download_path, user_id)
             
-            # המרת פורמט
             output_path = f"converted_{file.file_id}.mp4"
             subprocess.run([
                 "ffmpeg",
@@ -262,26 +287,25 @@ async def upload_file(client: Client, query: CallbackQuery):
                 output_path
             ], check=True)
             
-            # העלאת וידאו
             await client.send_video(
                 chat_id=user_id,
                 video=output_path,
                 thumb=thumb_path,
                 caption=f"📁 שם קובץ: `{new_name}`" if new_name else None,
                 progress=progress_callback,
-                progress_args=(start_time, progress_msg, "upload")
+                progress_args=(start_time, progress_msg, "upload"),
+                reply_to_message_id=original_msg_id
             )
         else:
-            # העלאת קובץ
             await client.send_document(
                 chat_id=user_id,
                 document=download_path,
                 file_name=new_name if new_name else None,
                 progress=progress_callback,
-                progress_args=(start_time, progress_msg, "upload")
+                progress_args=(start_time, progress_msg, "upload"),
+                reply_to_message_id=original_msg_id
             )
         
-        # ניקוי
         os.remove(download_path)
         if output_path and os.path.exists(output_path):
             os.remove(output_path)
@@ -290,7 +314,7 @@ async def upload_file(client: Client, query: CallbackQuery):
         
     except Exception as e:
         logger.error(f"שגיאה בהעלאה: {e}")
-        await query.message.reply_text("❌ אירעה שגיאה בעיבוד הקובץ")
+        await query.message.reply_text("❌ אירעה שגיאה בעיבוד הקובץ", reply_to_message_id=original_msg_id)
     finally:
         db.delete_active_task(user_id)
         db.data["users"].get(str(user_id), {}).pop("new_name", None)
@@ -317,8 +341,9 @@ async def progress_callback(current: int, total: int, start_time: float, message
 @app.on_callback_query(filters.regex("^cancel"))
 async def cancel_process(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
+    original_msg_id = db.get_original_message(user_id)
     db.delete_active_task(user_id)
-    await query.message.edit_text("❌ הפעולה בוטלה!")
+    await query.message.edit_text("❌ הפעולה בוטלה!", reply_to_message_id=original_msg_id)
 
 # ================= שרת בריאות =================
 class HealthHandler(BaseHTTPRequestHandler):
@@ -333,9 +358,6 @@ def run_health_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # הפעלת שרת הבריאות ב-thread נפרד
     health_thread = Thread(target=run_health_server, daemon=True)
     health_thread.start()
-    
-    # הפעלת הבוט
     app.run()
