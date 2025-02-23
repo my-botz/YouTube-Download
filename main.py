@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import time
@@ -319,4 +318,17 @@ async def cancel_process(client: Client, query: CallbackQuery):
     await query.message.edit_text("❌ הפעולה בוטלה!")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    app.start()
+    from aiohttp import web
+    import asyncio
+
+    async def health_check(request):
+        return web.Response(text="OK")
+
+    app_web = web.Application()
+    app_web.router.add_get('/', health_check)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    await asyncio.Event().wait()
