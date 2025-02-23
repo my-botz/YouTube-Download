@@ -223,7 +223,7 @@ async def ask_upload_type(client: Client, original_msg_id: int, user_id: int):
     )
     db.add_active_task(user_id, msg.id)
 
-@app.on_message(filters.text & ~filters.regex(r'^/') & filters.private))
+@app.on_message(filters.text & ~filters.regex(r'^/') & filters.private)
 async def handle_new_name(client: Client, message: Message):
     user_id = message.from_user.id
     original_msg_id = db.get_original_message(user_id)
