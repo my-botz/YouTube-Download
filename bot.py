@@ -24,12 +24,13 @@ os.makedirs("thumbnails", exist_ok=True)
 
 app = Client("file_converter_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# משתנה לעדכון התקדמות
+# משתנים לעדכון התקדמות וביטול תהליכים
 LAST_UPDATE = {}
 MIN_UPDATE_INTERVAL = 5  # שניות
 MIN_PERCENT_CHANGE = 10  # אחוז
+CANCEL_TASKS = {}  # מילון לביטול פעולות לפי משתמש
 
-# פונקציה לבדוק אם המשתמש רשאי לפעול (אם לא פרימיום – חייבים להמתין)
+# פונקציה לבדוק אם המשתמש רשאי לבצע פעולה
 def can_user_act(user_id: int) -> (bool, int):
     premium_until = db.get_premium_until(user_id)
     now = time.time()
@@ -41,15 +42,24 @@ def can_user_act(user_id: int) -> (bool, int):
         return False, remaining
     return True, 0
 
-# ================== Handlers למשתמשים רגילים ==================
+# הודעת /start משודרגת
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    await message.reply_text("👋 שלום! שלח לי קובץ או וידאו כדי להתחיל", reply_to_message_id=message.id)
+    welcome_text = (
+        "👋 **ברוכים הבאים לבוט הממיר הקבצים!**\n\n"
+        "שלח קובץ או וידאו, ושנה את שמו לפי הצורך. הבוט מציג התקדמות עם אחוזים, מהירות וזמן משוער.\n\n"
+        "אפשרויות נוספות:\n"
+        "• `/my_plan` – בדיקת תוכנית המשתמש\n"
+        "• שליחת תמונה לשמירת תמונת ממוזערת\n\n"
+        "בהצלחה!"
+    )
+    await message.reply_text(welcome_text, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
 
 @app.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
     user_id = message.from_user.id
     active = db.get_active_task(user_id)
+    CANCEL_TASKS[user_id] = True  # סימון ביטול תהליך
     if active:
         db.delete_active_task(user_id)
         await message.reply_text("❌ הפעולה בוטלה!", reply_to_message_id=message.id)
@@ -87,12 +97,18 @@ async def handle_file(client: Client, message: Message):
         await message.reply_text(f"⚠️ המתן עוד {remaining} שניות לפני ביצוע פעולה חדשה.", reply_to_message_id=message.id)
         return
 
-    if db.get_active_task(user_id):
-        return await message.reply_text("⚠️ יש לך משימה פעילה, נא להמתין לסיומה", reply_to_message_id=message.id)
-    
+    # סימון הפעולה כפעילה
     db.set_original_message(user_id, message.id)
     db.delete_active_task(user_id)
-    
+    CANCEL_TASKS[user_id] = False  # אתחול ביטול
+
+    # אם לא קיים שם חדש (לא בחרו לשנות), נשמור את השם המקורי של הקובץ
+    if not db.get_new_name(user_id):
+        if message.document and message.document.file_name:
+            db.save_new_name(user_id, message.document.file_name)
+        elif message.video and message.video.file_name:
+            db.save_new_name(user_id, message.video.file_name)
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ שנה שם", callback_data="rename_yes"),
@@ -155,10 +171,10 @@ async def handle_new_name(client: Client, message: Message):
     if db.is_waiting_for_name(user_id):
         try:
             await message.delete()
-        except:
+        except Exception:
             pass
         
-        new_name = message.text
+        new_name = message.text.strip()
         db.save_new_name(user_id, new_name)
         db.set_waiting_for_name(user_id, False)
         
@@ -167,8 +183,11 @@ async def handle_new_name(client: Client, message: Message):
 async def progress_callback(current: int, total: int, start_time: float, message: Message, action: str):
     try:
         user_id = message.chat.id
+        # בדיקת ביטול – אם המשתמש ביקש ביטול, נזרוק חריגה
+        if CANCEL_TASKS.get(user_id, False):
+            raise Exception("Cancelled by user")
+
         now = time.time()
-        
         should_update = False
         if user_id not in LAST_UPDATE:
             should_update = True
@@ -195,9 +214,9 @@ async def progress_callback(current: int, total: int, start_time: float, message
                 "time": now,
                 "percent": (current/total)*100
             }
-            
     except Exception as e:
         logger.error(f"שגיאה בעדכון התקדמות: {e}")
+        raise e  # כדי לאפס את התהליך במקרה של ביטול
 
 @app.on_callback_query(filters.regex(r"^upload_(video|file)"))
 async def upload_file(client: Client, query: CallbackQuery):
@@ -205,7 +224,7 @@ async def upload_file(client: Client, query: CallbackQuery):
     original_msg_id = db.get_original_message(user_id)
     upload_type = query.data.split("_")[1]
     
-    # במקום לשלוח הודעה חדשה – נערוך את ההודעה הקודמת
+    # נערוך את הודעת הבחירה
     progress_msg = query.message
     try:
         await progress_msg.edit_text("⬇️ מתחיל בהורדה...", parse_mode=ParseMode.MARKDOWN)
@@ -214,18 +233,24 @@ async def upload_file(client: Client, query: CallbackQuery):
     
     try:
         original_msg = await client.get_messages(chat_id=user_id, message_ids=original_msg_id)
-        
         file = original_msg.video or original_msg.document
         if not file:
             return await query.answer("❌ קובץ לא נתמך", show_alert=True)
         
         start_time = time.time()
+        # הורדת הקובץ
         download_path = await client.download_media(
             file.file_id,
             file_name=f"downloads/{file.file_id}",
             progress=progress_callback,
             progress_args=(start_time, progress_msg, "download")
         )
+        
+        # בדיקה במידה והמשתמש ביטל במהלך ההורדה
+        if CANCEL_TASKS.get(user_id, False):
+            await progress_msg.edit_text("❌ הפעולה בוטלה!")
+            os.remove(download_path)
+            return
         
         new_name = db.get_new_name(user_id)
         output_path = None
@@ -234,10 +259,15 @@ async def upload_file(client: Client, query: CallbackQuery):
             thumb_path = db.get_thumbnail(user_id) or generate_thumbnail(download_path, user_id)
             output_path = f"converted_{file.file_id}.mp4"
             try:
+                # המרת וידאו באמצעות re-encoding (ניתן להתאים את הפרמטרים)
                 subprocess.run([
                     "ffmpeg",
                     "-i", download_path,
-                    "-c", "copy",
+                    "-c:v", "libx264",
+                    "-crf", "23",
+                    "-preset", "veryfast",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
                     output_path
                 ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             except subprocess.CalledProcessError as e:
@@ -264,6 +294,7 @@ async def upload_file(client: Client, query: CallbackQuery):
                 reply_to_message_id=original_msg_id
             )
         
+        # ניקוי קבצים
         os.remove(download_path)
         if output_path and os.path.exists(output_path):
             os.remove(output_path)
@@ -275,23 +306,30 @@ async def upload_file(client: Client, query: CallbackQuery):
         
     except Exception as e:
         logger.error(f"שגיאה בהעלאה: {e}")
-        await query.message.reply_text("❌ אירעה שגיאה בעיבוד הקובץ", reply_to_message_id=original_msg_id)
+        try:
+            await query.message.edit_text("❌ אירעה שגיאה בעיבוד הקובץ", reply_to_message_id=original_msg_id)
+        except Exception:
+            pass
     finally:
         db.delete_active_task(user_id)
         db.delete_new_name(user_id)
         if user_id in LAST_UPDATE:
             del LAST_UPDATE[user_id]
+        if user_id in CANCEL_TASKS:
+            CANCEL_TASKS.pop(user_id)
 
 @app.on_callback_query(filters.regex("^cancel"))
 async def cancel_process(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    original_msg_id = db.get_original_message(user_id)
     db.delete_active_task(user_id)
-    await query.message.edit_text("❌ הפעולה בוטלה!", reply_to_message_id=original_msg_id)
-    if user_id in LAST_UPDATE:
-        del LAST_UPDATE[user_id]
+    CANCEL_TASKS[user_id] = True  # סימון ביטול
+    try:
+        await query.answer("הפעולה בוטלה", show_alert=True)
+        await query.message.edit_text("❌ הפעולה בוטלה!")
+    except Exception as e:
+        logger.error(f"שגיאה בטיפול בביטול: {e}")
 
-# ================== פקודות תכנית משתמש ופרימיום ==================
+# פקודות תכנית משתמש ופרימיום
 @app.on_message(filters.command("my_plan"))
 async def my_plan(client: Client, message: Message):
     user_id = message.from_user.id
@@ -302,16 +340,15 @@ async def my_plan(client: Client, message: Message):
         plan_info = f"✅ יש לך פרימיום למשך עוד {remaining // 3600} שעות ו-{(remaining % 3600) // 60} דקות."
     else:
         last_action = db.get_last_action_time(user_id)
-        if last_action:
-            wait = max(0, int(WAIT_TIME - (now - last_action)))
-        else:
-            wait = 0
+        wait = max(0, int(WAIT_TIME - (now - last_action))) if last_action else 0
         plan_info = f"🆓 חינמי. זמינות פעולה: {'מיידית' if wait==0 else f'עוד {wait} שניות'}."
     
-    plans = """תוכניות זמינות:\n1. חינמי - פעולה אחת כל 5 דקות\n2. פרימיום - ללא הגבלות (ניתן לשדרוג ע"י מנהל)"""
+    plans = ("תוכניות זמינות:\n"
+             "1. חינמי - פעולה אחת כל 5 דקות\n"
+             """2. פרימיום - ללא הגבלות (ניתן לשדרוג ע"י מנהל)")"""
     await message.reply_text(f"📊 התוכנית שלך:\n{plan_info}\n\n{plans}", reply_to_message_id=message.id)
 
-# ================== פקודות מנהל ==================
+# פקודות מנהל
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
