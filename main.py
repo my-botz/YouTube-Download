@@ -155,7 +155,7 @@ async def del_thumb(client: Client, message: Message):
     db.delete_thumbnail(message.from_user.id)
     await message.reply_text("✅ התמונה הממוזערת נמחקה", reply_to_message_id=message.id)
 
-@app.on_message(filters.photo))
+@app.on_message(filters.photo)
 async def save_thumbnail(client: Client, message: Message):
     db.save_thumbnail(message.from_user.id, message.photo.file_id)
     await message.reply_text("✅ תמונה ממוזערת נשמרה בהצלחה", reply_to_message_id=message.id)
