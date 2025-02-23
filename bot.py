@@ -345,7 +345,7 @@ async def my_plan(client: Client, message: Message):
     
     plans = ("תוכניות זמינות:\n"
              "1. חינמי - פעולה אחת כל 5 דקות\n"
-             """2. פרימיום - ללא הגבלות (ניתן לשדרוג ע"י מנהל)")"""
+             "2. פרימיום - ללא הגבלות (ניתן לשדרוג ע\"י מנהל)")
     await message.reply_text(f"📊 התוכנית שלך:\n{plan_info}\n\n{plans}", reply_to_message_id=message.id)
 
 # פקודות מנהל
