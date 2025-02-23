@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import time
@@ -6,6 +7,8 @@ import logging
 import subprocess
 from pathlib import Path
 from typing import Dict, Union
+from threading import Thread
+from flask import Flask
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -317,5 +320,20 @@ async def cancel_process(client: Client, query: CallbackQuery):
     db.delete_active_task(user_id)
     await query.message.edit_text("❌ הפעולה בוטלה!")
 
+# ================= שרת Flask לבריאות =================
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "OK"
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=PORT)
+
 if __name__ == "__main__":
-    app.start()
+    # הפעלת שרת Flask ב-thread נפרד
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # הפעלת הבוט
+    app.run()
