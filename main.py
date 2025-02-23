@@ -319,16 +319,3 @@ async def cancel_process(client: Client, query: CallbackQuery):
 
 if __name__ == "__main__":
     app.start()
-    from aiohttp import web
-    import asyncio
-
-    async def health_check(request):
-        return web.Response(text="OK")
-
-    app_web = web.Application()
-    app_web.router.add_get('/', health_check)
-    runner = web.AppRunner(app_web)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    await asyncio.Event().wait()
