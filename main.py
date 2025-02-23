@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import time
@@ -137,6 +138,15 @@ def generate_thumbnail(video_path: str, user_id: int):
 async def start(client: Client, message: Message):
     await message.reply_text("👋 שלום! שלח לי קובץ או וידאו כדי להתחיל", reply_to_message_id=message.id)
 
+@app.on_message(filters.command("cancel"))
+async def cancel_command(client: Client, message: Message):
+    user_id = message.from_user.id
+    if db.data["users"].get(str(user_id), {}).get("active_task"):
+        db.delete_active_task(user_id)
+        await message.reply_text("❌ הפעולה בוטלה!", reply_to_message_id=message.id)
+    else:
+        await message.reply_text("⚠️ אין פעולה פעילה לביטול", reply_to_message_id=message.id)
+
 @app.on_message(filters.command("view_thumb"))
 async def view_thumb(client: Client, message: Message):
     thumb = db.get_thumbnail(message.from_user.id)
@@ -243,6 +253,49 @@ async def handle_new_name(client: Client, message: Message):
         await ask_upload_type(client, original_msg_id, user_id)
         db.set_waiting_for_name(user_id, False)
 
+# משתנים גלובליים לניהול עדכונים
+LAST_UPDATE = {}
+MIN_UPDATE_INTERVAL = 5  # 5 שניות
+MIN_PERCENT_CHANGE = 10  # 10%
+
+async def progress_callback(current: int, total: int, start_time: float, message: Message, action: str):
+    try:
+        user_id = message.chat.id
+        now = time.time()
+        
+        # בדיקת תנאי עדכון
+        should_update = False
+        if user_id not in LAST_UPDATE:
+            should_update = True
+        else:
+            time_diff = now - LAST_UPDATE[user_id]["time"]
+            percent_diff = ((current/total)*100) - LAST_UPDATE[user_id]["percent"]
+            if time_diff >= MIN_UPDATE_INTERVAL or percent_diff >= MIN_PERCENT_CHANGE:
+                should_update = True
+        
+        if should_update:
+            progress = await progress_bar(current, total, start_time)
+            text = (
+                f"**{'⬇️ מוריד' if action == 'download' else '⬆️ מעלה'} את הקובץ**\n\n"
+                f"**גודל קובץ:** `{humanbytes(total)}`\n"
+                f"{progress}"
+            )
+            
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ בטל", callback_data="cancel")]])
+            await message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            # עדכון זמן ואחוז אחרון
+            LAST_UPDATE[user_id] = {
+                "time": now,
+                "percent": (current/total)*100
+            }
+            
+    except Exception as e:
+        logger.error(f"שגיאה בעדכון התקדמות: {e}")
+
 @app.on_callback_query(filters.regex(r"^upload_(video|file)"))
 async def upload_file(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
@@ -319,24 +372,8 @@ async def upload_file(client: Client, query: CallbackQuery):
         db.delete_active_task(user_id)
         db.data["users"].get(str(user_id), {}).pop("new_name", None)
         db._save()
-
-async def progress_callback(current: int, total: int, start_time: float, message: Message, action: str):
-    try:
-        progress = await progress_bar(current, total, start_time)
-        text = (
-            f"**{'⬇️ מוריד' if action == 'download' else '⬆️ מעלה'} את הקובץ**\n\n"
-            f"**גודל קובץ:** `{humanbytes(total)}`\n"
-            f"{progress}"
-        )
-        
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ בטל", callback_data="cancel")]])
-        await message.edit_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        logger.error(f"שגיאה בעדכון התקדמות: {e}")
+        if user_id in LAST_UPDATE:
+            del LAST_UPDATE[user_id]
 
 @app.on_callback_query(filters.regex("^cancel"))
 async def cancel_process(client: Client, query: CallbackQuery):
@@ -344,6 +381,8 @@ async def cancel_process(client: Client, query: CallbackQuery):
     original_msg_id = db.get_original_message(user_id)
     db.delete_active_task(user_id)
     await query.message.edit_text("❌ הפעולה בוטלה!", reply_to_message_id=original_msg_id)
+    if user_id in LAST_UPDATE:
+        del LAST_UPDATE[user_id]
 
 # ================= שרת בריאות =================
 class HealthHandler(BaseHTTPRequestHandler):
